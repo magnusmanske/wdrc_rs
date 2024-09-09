@@ -1,0 +1,15 @@
+{
+	"wikidata": {
+		"url": "mysql://USER:PASSWORD@127.0.0.1:3309/wikidatawiki_p",
+		"min_connections": 0,
+		"max_connections": 2,
+		"keep_sec": 120
+	},
+	"wdrc": {
+		"url": "mysql://USER:PASSWORD@127.0.0.1:3308/s55078__wdrc_p",
+		"min_connections": 0,
+		"max_connections": 8,
+		"keep_sec": 120
+	},
+	"max_recent_changes": 500
+}
