@@ -53,49 +53,34 @@ pub struct Change {
     pub text: String,
     pub site: String,
     pub title: String,
-    pub property: String, // TODO numeric?
+    pub property: String,
     pub id: String,
     pub item_id: ItemId,
     pub revision_id: RevisionId,
+    pub timestamp: String,
 }
 
 impl Change {
-    pub async fn log_statement_change(&self, conn: &mut Conn) -> Result<()> {
+    pub fn get_statement_log(&self) -> Result<String> {
         let property = WdRc::make_id_numeric(&self.property)?;
-        let timestamp = TimeStamp::now();
-        let sql = "INSERT IGNORE INTO `statements` (`item`,`revision`,`property`,`timestamp`,`change_type`) VALUES (?,?,?,?,?)";
-        conn.exec_drop(
-            sql,
-            (
-                self.item_id,
-                self.revision_id,
-                property,
-                timestamp,
-                self.change_type.as_str(),
-            ),
-        )
-        .await
-        .map_err(|e| anyhow!("Error logging change: {}", e))?;
-        Ok(())
+        Ok(format!(
+            "({},{},{property},'{}','{}')",
+            self.item_id,
+            self.revision_id,
+            self.timestamp,
+            self.change_type.as_str()
+        ))
     }
 
-    /// This logs labels, descriptions, aliases, and sitelinks
-    pub async fn log_label_change(&self, text_id: TextId, conn: &mut Conn) -> Result<()> {
-        let timestamp = TimeStamp::now();
-        let sql = "INSERT IGNORE INTO `labels` (`item`,`revision`,`type`,`timestamp`,`change_type`,`language`) VALUES (?,?,?,?,?,?)";
-        conn.exec_drop(
-            sql,
-            (
-                self.item_id,
-                self.revision_id,
-                self.subject.as_str(),
-                timestamp,
-                self.change_type.as_str(),
-                text_id,
-            ),
+    pub fn get_label_log(&self, text_id: TextId) -> String {
+        format!(
+            "({},{},'{}','{}','{}',{})",
+            self.item_id,
+            self.revision_id,
+            self.subject.as_str(),
+            self.timestamp,
+            self.change_type.as_str(),
+            text_id
         )
-        .await
-        .map_err(|e| anyhow!("Error logging change: {}", e))?;
-        Ok(())
     }
 }

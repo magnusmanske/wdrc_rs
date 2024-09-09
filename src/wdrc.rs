@@ -155,9 +155,6 @@ impl WdRc {
         );
 
         // Determine and set new oldest timestamp
-        let new_oldest = rc.get_last_rc_timetamp(&oldest);
-        println!("New oldest: {new_oldest}");
-        //let _ = self.set_key_value("timestamp",new_oldest).await; // TODO
         Ok(rc)
     }
 
@@ -226,7 +223,7 @@ impl WdRc {
 
         let mut futures = vec![];
         for (ci, revision_compare) in rc.changed_items.iter().zip(rcs.iter_mut()) {
-            let future = revision_compare.run(&ci.q, ci.old, ci.new);
+            let future = revision_compare.run(&ci.q, ci.old, ci.new, &ci.timestamp);
             futures.push(future);
         }
         let stream = futures::stream::iter(futures).buffer_unordered(MAX_API_CONCURRENT);
@@ -237,12 +234,11 @@ impl WdRc {
             .filter_map(|r| r.ok())
             .flatten()
             .collect::<Vec<_>>();
-        // println!("{changes:#?}");
+        println!("CHANGES: {}", changes.len());
 
         self.log_changes(&changes).await?;
-        // for change in changes {
-        // println!("Change: {change}");
-        // }
+        let new_oldest = rc.get_last_rc_timetamp("20000101000000");
+        let _ = self.set_key_value("timestamp", &new_oldest).await;
         Ok(())
     }
 
@@ -356,40 +352,87 @@ impl WdRc {
         Ok(results)
     }
 
-    async fn log_statement_change(&self, ci: &Change) -> Result<()> {
-        let mut conn = self.db.get_connection("wdrc").await?;
-        ci.log_statement_change(&mut conn).await?;
+    async fn log_statement_changes(&self, changes: &[Change]) -> Result<()> {
+        let values = changes
+            .iter()
+            .filter(|c| c.subject == ChangeSubject::Claims)
+            .filter_map(|c| c.get_statement_log().ok())
+            .collect::<Vec<String>>();
+        if !values.is_empty() {
+            let  sql = format!("INSERT IGNORE INTO `statements` (`item`,`revision`,`property`,`timestamp`,`change_type`) VALUES {}",values.join(",")) ;
+            self.db
+                .get_connection("wdrc")
+                .await?
+                .exec_drop(&sql, ())
+                .await?;
+        }
         Ok(())
     }
 
-    async fn log_sitelinks_change(&mut self, ci: &Change) -> Result<()> {
-        let text_id = self.get_or_create_text_id(&ci.site).await?;
-        let mut conn = self.db.get_connection("wdrc").await?;
-        ci.log_label_change(text_id, &mut conn).await?;
+    async fn log_sitelinks_changes(&mut self, changes: &[Change]) -> Result<()> {
+        let changes: Vec<&Change> = changes
+            .iter()
+            .filter(|c| c.subject == ChangeSubject::Sitelinks)
+            .collect();
+        let mut parts = vec![];
+        for ci in changes {
+            let text_id = match self.get_or_create_text_id(&ci.site).await {
+                Ok(text_id) => text_id,
+                Err(_) => continue,
+            };
+            let part = ci.get_label_log(text_id);
+            parts.push(part);
+        }
+        if !parts.is_empty() {
+            let sql = format!(
+				"INSERT IGNORE INTO `labels` (`item`,`revision`,`type`,`timestamp`,`change_type`,`language`) VALUES {}",
+				parts.join(",")
+			);
+            self.db
+                .get_connection("wdrc")
+                .await?
+                .exec_drop(&sql, ())
+                .await?;
+        }
         Ok(())
     }
 
-    async fn log_label_change(&mut self, ci: &Change) -> Result<()> {
-        let text_id = self.get_or_create_text_id(&ci.language).await?;
-        let mut conn = self.db.get_connection("wdrc").await?;
-        ci.log_label_change(text_id, &mut conn).await?;
+    async fn log_label_changes(&mut self, changes: &[Change]) -> Result<()> {
+        let changes: Vec<&Change> = changes
+            .iter()
+            .filter(|c| {
+                c.subject == ChangeSubject::Labels
+                    || c.subject == ChangeSubject::Descriptions
+                    || c.subject == ChangeSubject::Aliases
+            })
+            .collect();
+        let mut parts = vec![];
+        for ci in changes {
+            let text_id = match self.get_or_create_text_id(&ci.language).await {
+                Ok(text_id) => text_id,
+                Err(_) => continue,
+            };
+            let part = ci.get_label_log(text_id);
+            parts.push(part);
+        }
+        if !parts.is_empty() {
+            let sql = format!(
+				"INSERT IGNORE INTO `labels` (`item`,`revision`,`type`,`timestamp`,`change_type`,`language`) VALUES {}",
+				parts.join(",")
+			);
+            self.db
+                .get_connection("wdrc")
+                .await?
+                .exec_drop(&sql, ())
+                .await?;
+        }
         Ok(())
     }
 
     async fn log_changes(&mut self, changes: &[Change]) -> Result<()> {
-        for change in changes {
-            match change.subject {
-                ChangeSubject::Claims => {
-                    self.log_statement_change(change).await?;
-                }
-                ChangeSubject::Sitelinks => {
-                    self.log_sitelinks_change(change).await?;
-                }
-                _ => {
-                    self.log_label_change(change).await?;
-                }
-            }
-        }
+        self.log_statement_changes(changes).await?;
+        self.log_sitelinks_changes(changes).await?;
+        self.log_label_changes(changes).await?;
         Ok(())
     }
 

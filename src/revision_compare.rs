@@ -14,6 +14,7 @@ pub struct RevisionCompare {
     wd: Arc<Wikidata>,
     item_id: ItemId,
     revision_id: RevisionId,
+    timestamp: String,
 }
 
 impl RevisionCompare {
@@ -22,6 +23,7 @@ impl RevisionCompare {
             wd,
             item_id: 0,
             revision_id: 0,
+            timestamp: "".to_string(),
         }
     }
 
@@ -30,9 +32,11 @@ impl RevisionCompare {
         q: &str,
         rev_id_old: RevisionId,
         rev_id_new: RevisionId,
+        timestamp: &str,
     ) -> Result<Vec<Change>> {
         self.item_id = WdRc::make_id_numeric(q)?;
         self.revision_id = rev_id_new;
+        self.timestamp = timestamp.to_string();
 
         let revisions = self
             .get_revisions_for_item(q, rev_id_old, rev_id_new)
@@ -43,7 +47,6 @@ impl RevisionCompare {
         let rev_new = revisions
             .get(&rev_id_new)
             .ok_or_else(|| anyhow!("Could not load {q} new revision {rev_id_new}"))?;
-
         let ret = self.compare_revisions(rev_old, rev_new);
         Ok(ret)
     }
@@ -115,6 +118,7 @@ impl RevisionCompare {
                     ret.push(Change {
                         item_id: self.item_id,
                         revision_id: self.revision_id,
+                        timestamp: self.timestamp.to_owned(),
                         subject: key.to_owned(),
                         change_type: ChangeType::Changed,
                         language: language.to_owned(),
@@ -126,6 +130,7 @@ impl RevisionCompare {
                 ret.push(Change {
                     item_id: self.item_id,
                     revision_id: self.revision_id,
+                    timestamp: self.timestamp.to_owned(),
                     subject: key.to_owned(),
                     change_type: ChangeType::Removed,
                     language: language.to_owned(),
@@ -143,6 +148,7 @@ impl RevisionCompare {
                 ret.push(Change {
                     item_id: self.item_id,
                     revision_id: self.revision_id,
+                    timestamp: self.timestamp.to_owned(),
                     subject: key.to_owned(),
                     change_type: ChangeType::Added,
                     language: language.to_owned(),
@@ -177,6 +183,7 @@ impl RevisionCompare {
                 ret.push(Change {
                     item_id: self.item_id,
                     revision_id: self.revision_id,
+                    timestamp: self.timestamp.to_owned(),
                     subject: ChangeSubject::Aliases,
                     change_type: ChangeType::Removed,
                     language: language.to_string(),
@@ -190,6 +197,7 @@ impl RevisionCompare {
                 ret.push(Change {
                     item_id: self.item_id,
                     revision_id: self.revision_id,
+                    timestamp: self.timestamp.to_owned(),
                     subject: ChangeSubject::Aliases,
                     change_type: ChangeType::Added,
                     language: language.to_string(),
@@ -210,7 +218,6 @@ impl RevisionCompare {
         all_languages.sort();
         all_languages.dedup();
 
-        println!("{old:?}");
         for language in all_languages {
             let old_aliases = Self::extract_aliases_from_map(&old, &language);
             let new_aliases = Self::extract_aliases_from_map(&new, &language);
@@ -241,6 +248,7 @@ impl RevisionCompare {
                     ret.push(Change {
                         item_id: self.item_id,
                         revision_id: self.revision_id,
+                        timestamp: self.timestamp.to_owned(),
                         subject: ChangeSubject::Sitelinks,
                         change_type: ChangeType::Changed,
                         site: site.to_string(),
@@ -252,6 +260,7 @@ impl RevisionCompare {
                 ret.push(Change {
                     item_id: self.item_id,
                     revision_id: self.revision_id,
+                    timestamp: self.timestamp.to_owned(),
                     subject: ChangeSubject::Sitelinks,
                     change_type: ChangeType::Removed,
                     site: site.to_string(),
@@ -269,6 +278,7 @@ impl RevisionCompare {
                 ret.push(Change {
                     item_id: self.item_id,
                     revision_id: self.revision_id,
+                    timestamp: self.timestamp.to_owned(),
                     subject: ChangeSubject::Sitelinks,
                     change_type: ChangeType::Added,
                     site: site.to_string(),
@@ -310,6 +320,7 @@ impl RevisionCompare {
                     ret.push(Change {
                         item_id: self.item_id,
                         revision_id: self.revision_id,
+                        timestamp: self.timestamp.to_owned(),
                         subject: ChangeSubject::Claims,
                         change_type: ChangeType::Removed,
                         property: property.to_string(),
@@ -322,6 +333,7 @@ impl RevisionCompare {
                         ret.push(Change {
                             item_id: self.item_id,
                             revision_id: self.revision_id,
+                            timestamp: self.timestamp.to_owned(),
                             subject: ChangeSubject::Claims,
                             change_type: ChangeType::Changed,
                             property: property.to_string(),
@@ -340,6 +352,7 @@ impl RevisionCompare {
                     ret.push(Change {
                         item_id: self.item_id,
                         revision_id: self.revision_id,
+                        timestamp: self.timestamp.to_owned(),
                         subject: ChangeSubject::Claims,
                         change_type: ChangeType::Added,
                         property: property.to_string(),
