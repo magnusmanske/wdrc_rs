@@ -21,19 +21,6 @@ const CONFIG_FILE: &str = "config.json";
 const MAX_RECENT_CHANGES: u64 = 500;
 const MAX_API_CONCURRENT: usize = 50;
 
-/*
-function get_revisions_url ( $q , $rev_id_old , $rev_id_new ) {
-function extract_revisions ( $q , $rev_id_old , $rev_id_new , $j ) {
-function get_revisions_for_item ( $q , $rev_id_old , $rev_id_new ) {
-function compare_labels_descriptions ( $rev_old , $rev_new , $key , &$ret ) {
-function compare_aliases ( $rev_old , $rev_new , &$ret ) {
-function compare_sitelinks ( $rev_old , $rev_new , &$ret ) {
-function get_claim_by_id ( $claim_id , $claims ) {
-function compare_statements ( $rev_old , $rev_new , &$ret ) {
-function compare_revisions ( $rev_old , $rev_new ) {
-function get_recent_changes() {
-*/
-
 #[derive(Clone, Debug)]
 struct RecentRedirects {
     source: String,
@@ -134,7 +121,7 @@ impl RecentChangesResults {
 }
 
 #[derive(Debug)]
-pub struct WDRC {
+pub struct WdRc {
     text_cache: HashMap<String, usize>,
     wd: Arc<Wikidata>,
     db: ToolforgeDB,
@@ -142,10 +129,10 @@ pub struct WDRC {
     max_recent_changes: u64,
 }
 
-impl WDRC {
-    pub fn new() -> WDRC {
+impl WdRc {
+    pub fn new() -> WdRc {
         let config = Self::read_config();
-        WDRC {
+        WdRc {
             text_cache: HashMap::new(),
             _config: config.to_owned(),
             wd: Self::prepare_wd(),
@@ -186,8 +173,8 @@ impl WDRC {
             .await?
             .map_and_drop(RecentChanges::from_row)
             .await?
-            .iter()
-            .filter_map(|r| r.to_owned())
+            .into_iter()
+            .flatten()
             .collect();
         Ok(results)
     }
@@ -227,31 +214,34 @@ impl WDRC {
         Ok(())
     }
 
-    pub async fn log_recent_changes(&self, rc: &RecentChangesResults) -> Result<()> {
+    pub async fn log_recent_changes(&mut self, rc: &RecentChangesResults) -> Result<()> {
         if rc.changed_items.is_empty() {
             return Ok(());
         }
-        let revision_compare = RevisionCompare::new(self.wd.clone());
+        let mut rcs = vec![];
+        for _ci in &rc.changed_items {
+            let revision_compare = RevisionCompare::new(self.wd.clone());
+            rcs.push(revision_compare);
+        }
+
         let mut futures = vec![];
-        for ci in &rc.changed_items {
+        for (ci, revision_compare) in rc.changed_items.iter().zip(rcs.iter_mut()) {
             let future = revision_compare.run(&ci.q, ci.old, ci.new);
             futures.push(future);
         }
         let stream = futures::stream::iter(futures).buffer_unordered(MAX_API_CONCURRENT);
-        let results = stream.collect::<Vec<_>>().await;
-        let results = results
+        let changes = stream
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
             .filter_map(|r| r.ok())
             .flatten()
             .collect::<Vec<_>>();
-        println!("{results:#?}");
+        // println!("{changes:#?}");
 
-        // let results = futures::future::join_all(futures).await;
-        // for changed in rc.changed_items {
-        //     println!(
-        //         "Changed item: {} from {} to {} at {}",
-        //         changed.q, changed.old, changed.new, changed.timestamp
-        //     );
+        self.log_changes(&changes).await?;
+        // for change in changes {
+        // println!("Change: {change}");
         // }
         Ok(())
     }
@@ -366,58 +356,37 @@ impl WDRC {
         Ok(results)
     }
 
-    async fn log_statement_change(
-        &self,
-        item_id: ItemId,
-        revision_id: RevisionId,
-        ci: &Change,
-    ) -> Result<()> {
+    async fn log_statement_change(&self, ci: &Change) -> Result<()> {
         let mut conn = self.db.get_connection("wdrc").await?;
-        ci.log_statement_change(item_id, revision_id, &mut conn)
-            .await?;
+        ci.log_statement_change(&mut conn).await?;
         Ok(())
     }
 
-    async fn log_sitelinks_change(
-        &mut self,
-        item_id: ItemId,
-        revision_id: RevisionId,
-        ci: &Change,
-    ) -> Result<()> {
+    async fn log_sitelinks_change(&mut self, ci: &Change) -> Result<()> {
         let text_id = self.get_or_create_text_id(&ci.site).await?;
         let mut conn = self.db.get_connection("wdrc").await?;
-        ci.log_label_change(item_id, revision_id, text_id, &mut conn)
-            .await?;
+        ci.log_label_change(text_id, &mut conn).await?;
         Ok(())
     }
 
-    async fn log_label_change(
-        &mut self,
-        item_id: ItemId,
-        revision_id: RevisionId,
-        ci: &Change,
-    ) -> Result<()> {
+    async fn log_label_change(&mut self, ci: &Change) -> Result<()> {
         let text_id = self.get_or_create_text_id(&ci.language).await?;
         let mut conn = self.db.get_connection("wdrc").await?;
-        ci.log_label_change(item_id, revision_id, text_id, &mut conn)
-            .await?;
+        ci.log_label_change(text_id, &mut conn).await?;
         Ok(())
     }
 
-    async fn log_changes(&mut self, rc: &RecentChanges, changes: &[Change]) -> Result<()> {
+    async fn log_changes(&mut self, changes: &[Change]) -> Result<()> {
         for change in changes {
             match change.subject {
                 ChangeSubject::Claims => {
-                    self.log_statement_change(rc.item_id(), rc.revision_id(), change)
-                        .await?;
+                    self.log_statement_change(change).await?;
                 }
                 ChangeSubject::Sitelinks => {
-                    self.log_sitelinks_change(rc.item_id(), rc.revision_id(), change)
-                        .await?;
+                    self.log_sitelinks_change(change).await?;
                 }
                 _ => {
-                    self.log_label_change(rc.item_id(), rc.revision_id(), change)
-                        .await?;
+                    self.log_label_change(change).await?;
                 }
             }
         }
@@ -431,7 +400,7 @@ impl WDRC {
             None => {
                 let sql = "INSERT INTO `texts` (`value`) VALUES (?)";
                 let mut conn = self.db.get_connection("wdrc").await?;
-                conn.exec_drop(&sql, (text,))
+                conn.exec_drop(sql, (text,))
                     .await
                     .map_err(|e| anyhow!("Error inserting text: {}", e))?;
                 let id = conn
@@ -444,33 +413,34 @@ impl WDRC {
     }
 
     async fn chache_texts_in_memory(&mut self) -> Result<()> {
-        Ok(if self.text_cache.is_empty() {
+        if self.text_cache.is_empty() {
             let sql = "SELECT `value`,`id` FROM `texts`";
             let mut conn = self.db.get_connection("wdrc").await?;
             let result: Vec<(String, usize)> = conn
-                .exec_iter(&sql, ())
+                .exec_iter(sql, ())
                 .await?
                 .map_and_drop(from_row::<(String, usize)>)
                 .await?;
             self.text_cache = result.into_iter().collect();
-        })
+        }
+        Ok(())
     }
 
     async fn get_key_value(&self, key: &str) -> Result<Option<String>> {
         let sql = "SELECT value FROM `meta` WHERE `key`=?";
         let mut conn = self.db.get_connection("wdrc").await?;
         let result: Vec<String> = conn
-            .exec_iter(&sql, (key,))
+            .exec_iter(sql, (key,))
             .await?
             .map_and_drop(from_row::<String>)
             .await?;
-        Ok(result.get(0).map(|s| s.to_string()))
+        Ok(result.first().map(|s| s.to_string()))
     }
 
     async fn set_key_value(&self, key: &str, value: &str) -> Result<()> {
         let sql = "UPDATE `meta` SET `value`=? WHERE `key`=?";
         let mut conn = self.db.get_connection("wdrc").await?;
-        conn.exec_drop(&sql, (value, key)).await?;
+        conn.exec_drop(sql, (value, key)).await?;
         Ok(())
     }
 
@@ -497,9 +467,9 @@ impl WDRC {
         db
     }
 
-    pub async fn purge_old_entries(&self) -> Result<()> {
-        todo!()
-    }
+    // pub async fn purge_old_entries(&self) -> Result<()> {
+    //     todo!()
+    // }
 }
 
 #[cfg(test)]
@@ -508,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_text_id() {
-        let mut wdrc = WDRC::new();
+        let mut wdrc = WdRc::new();
         let text = "aawikibooks";
         let id = wdrc.get_or_create_text_id(text).await.unwrap();
         assert_eq!(id, 1252);

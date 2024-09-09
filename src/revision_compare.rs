@@ -3,25 +3,37 @@ use serde_json::{json, Map, Value};
 use std::{collections::HashMap, sync::Arc};
 use wikimisc::wikidata::Wikidata;
 
-use crate::change::{Change, ChangeSubject, ChangeType};
+use crate::{
+    change::{Change, ChangeSubject, ChangeType},
+    ItemId, WdRc,
+};
 
 pub type RevisionId = u64;
 
 pub struct RevisionCompare {
     wd: Arc<Wikidata>,
+    item_id: ItemId,
+    revision_id: RevisionId,
 }
 
 impl RevisionCompare {
     pub fn new(wd: Arc<Wikidata>) -> RevisionCompare {
-        RevisionCompare { wd }
+        RevisionCompare {
+            wd,
+            item_id: 0,
+            revision_id: 0,
+        }
     }
 
     pub async fn run(
-        &self,
+        &mut self,
         q: &str,
         rev_id_old: RevisionId,
         rev_id_new: RevisionId,
     ) -> Result<Vec<Change>> {
+        self.item_id = WdRc::make_id_numeric(q)?;
+        self.revision_id = rev_id_new;
+
         let revisions = self
             .get_revisions_for_item(q, rev_id_old, rev_id_new)
             .await?;
@@ -31,7 +43,8 @@ impl RevisionCompare {
         let rev_new = revisions
             .get(&rev_id_new)
             .ok_or_else(|| anyhow!("Could not load {q} new revision {rev_id_new}"))?;
-        let ret = Self::compare_revisions(rev_old, rev_new);
+
+        let ret = self.compare_revisions(rev_old, rev_new);
         Ok(ret)
     }
 
@@ -80,6 +93,7 @@ impl RevisionCompare {
     }
 
     fn compare_labels_descriptions(
+        &self,
         rev_old: &Value,
         rev_new: &Value,
         key: ChangeSubject,
@@ -99,6 +113,8 @@ impl RevisionCompare {
                 };
                 if label != new_label {
                     ret.push(Change {
+                        item_id: self.item_id,
+                        revision_id: self.revision_id,
                         subject: key.to_owned(),
                         change_type: ChangeType::Changed,
                         language: language.to_owned(),
@@ -108,6 +124,8 @@ impl RevisionCompare {
                 }
             } else {
                 ret.push(Change {
+                    item_id: self.item_id,
+                    revision_id: self.revision_id,
                     subject: key.to_owned(),
                     change_type: ChangeType::Removed,
                     language: language.to_owned(),
@@ -123,6 +141,8 @@ impl RevisionCompare {
                     None => continue,
                 };
                 ret.push(Change {
+                    item_id: self.item_id,
+                    revision_id: self.revision_id,
                     subject: key.to_owned(),
                     change_type: ChangeType::Added,
                     language: language.to_owned(),
@@ -134,15 +154,16 @@ impl RevisionCompare {
         ret
     }
 
-    fn compare_labels(rev_old: &Value, rev_new: &Value) -> Vec<Change> {
-        Self::compare_labels_descriptions(rev_old, rev_new, ChangeSubject::Labels)
+    fn compare_labels(&self, rev_old: &Value, rev_new: &Value) -> Vec<Change> {
+        self.compare_labels_descriptions(rev_old, rev_new, ChangeSubject::Labels)
     }
 
-    fn compare_descriptions(rev_old: &Value, rev_new: &Value) -> Vec<Change> {
-        Self::compare_labels_descriptions(rev_old, rev_new, ChangeSubject::Descriptions)
+    fn compare_descriptions(&self, rev_old: &Value, rev_new: &Value) -> Vec<Change> {
+        self.compare_labels_descriptions(rev_old, rev_new, ChangeSubject::Descriptions)
     }
 
     fn compare_aliases_in_language(
+        &self,
         language: &str,
         old_aliases: &Vec<String>,
         new_aliases: &Vec<String>,
@@ -154,6 +175,8 @@ impl RevisionCompare {
         for alias in old_aliases {
             if !new_aliases.contains(alias) {
                 ret.push(Change {
+                    item_id: self.item_id,
+                    revision_id: self.revision_id,
                     subject: ChangeSubject::Aliases,
                     change_type: ChangeType::Removed,
                     language: language.to_string(),
@@ -165,6 +188,8 @@ impl RevisionCompare {
         for alias in new_aliases {
             if !old_aliases.contains(alias) {
                 ret.push(Change {
+                    item_id: self.item_id,
+                    revision_id: self.revision_id,
                     subject: ChangeSubject::Aliases,
                     change_type: ChangeType::Added,
                     language: language.to_string(),
@@ -176,7 +201,7 @@ impl RevisionCompare {
         ret
     }
 
-    fn compare_aliases(rev_old: &Value, rev_new: &Value) -> Vec<Change> {
+    fn compare_aliases(&self, rev_old: &Value, rev_new: &Value) -> Vec<Change> {
         let mut ret = vec![];
         let old = Self::json_object(rev_old, "aliases");
         let new = Self::json_object(rev_new, "aliases");
@@ -189,7 +214,7 @@ impl RevisionCompare {
         for language in all_languages {
             let old_aliases = Self::extract_aliases_from_map(&old, &language);
             let new_aliases = Self::extract_aliases_from_map(&new, &language);
-            ret.append(&mut Self::compare_aliases_in_language(
+            ret.append(&mut self.compare_aliases_in_language(
                 &language,
                 &old_aliases,
                 &new_aliases,
@@ -198,7 +223,7 @@ impl RevisionCompare {
         ret
     }
 
-    fn compare_sitelinks(rev_old: &Value, rev_new: &Value) -> Vec<Change> {
+    fn compare_sitelinks(&self, rev_old: &Value, rev_new: &Value) -> Vec<Change> {
         let mut ret = vec![];
         let old = Self::json_object(rev_old, "sitelinks");
         let new = Self::json_object(rev_new, "sitelinks");
@@ -214,6 +239,8 @@ impl RevisionCompare {
                 };
                 if link != new_link {
                     ret.push(Change {
+                        item_id: self.item_id,
+                        revision_id: self.revision_id,
                         subject: ChangeSubject::Sitelinks,
                         change_type: ChangeType::Changed,
                         site: site.to_string(),
@@ -223,6 +250,8 @@ impl RevisionCompare {
                 }
             } else {
                 ret.push(Change {
+                    item_id: self.item_id,
+                    revision_id: self.revision_id,
                     subject: ChangeSubject::Sitelinks,
                     change_type: ChangeType::Removed,
                     site: site.to_string(),
@@ -238,6 +267,8 @@ impl RevisionCompare {
                     None => continue,
                 };
                 ret.push(Change {
+                    item_id: self.item_id,
+                    revision_id: self.revision_id,
                     subject: ChangeSubject::Sitelinks,
                     change_type: ChangeType::Added,
                     site: site.to_string(),
@@ -261,7 +292,7 @@ impl RevisionCompare {
         None
     }
 
-    fn compare_statements(rev_old: &Value, rev_new: &Value) -> Vec<Change> {
+    fn compare_statements(&self, rev_old: &Value, rev_new: &Value) -> Vec<Change> {
         let mut ret = vec![];
         let old_claims = Self::json_object(rev_old, "claims");
         let new_claims = Self::json_object(rev_new, "claims");
@@ -277,6 +308,8 @@ impl RevisionCompare {
                 let new_claim = Self::get_claim_by_id(claim_id, &new_claims);
                 if new_claim.is_none() {
                     ret.push(Change {
+                        item_id: self.item_id,
+                        revision_id: self.revision_id,
                         subject: ChangeSubject::Claims,
                         change_type: ChangeType::Removed,
                         property: property.to_string(),
@@ -287,6 +320,8 @@ impl RevisionCompare {
                     let new_claim = new_claim.unwrap();
                     if claim != &new_claim {
                         ret.push(Change {
+                            item_id: self.item_id,
+                            revision_id: self.revision_id,
                             subject: ChangeSubject::Claims,
                             change_type: ChangeType::Changed,
                             property: property.to_string(),
@@ -303,6 +338,8 @@ impl RevisionCompare {
                 let old_claim = Self::get_claim_by_id(claim_id, &old_claims);
                 if old_claim.is_none() {
                     ret.push(Change {
+                        item_id: self.item_id,
+                        revision_id: self.revision_id,
                         subject: ChangeSubject::Claims,
                         change_type: ChangeType::Added,
                         property: property.to_string(),
@@ -316,13 +353,13 @@ impl RevisionCompare {
         ret
     }
 
-    fn compare_revisions(rev_old: &Value, rev_new: &Value) -> Vec<Change> {
+    fn compare_revisions(&self, rev_old: &Value, rev_new: &Value) -> Vec<Change> {
         let mut ret = vec![];
-        ret.append(&mut Self::compare_labels(rev_old, rev_new));
-        ret.append(&mut Self::compare_descriptions(rev_old, rev_new));
-        ret.append(&mut Self::compare_aliases(rev_old, rev_new));
-        ret.append(&mut Self::compare_statements(rev_old, rev_new));
-        ret.append(&mut Self::compare_sitelinks(rev_old, rev_new));
+        ret.append(&mut self.compare_labels(rev_old, rev_new));
+        ret.append(&mut self.compare_descriptions(rev_old, rev_new));
+        ret.append(&mut self.compare_aliases(rev_old, rev_new));
+        ret.append(&mut self.compare_statements(rev_old, rev_new));
+        ret.append(&mut self.compare_sitelinks(rev_old, rev_new));
         ret
     }
 
@@ -402,7 +439,9 @@ mod tests {
             "de": {"value": "alt"},
             "it": {"value":"nuovo"}}
         });
-        let changes = RevisionCompare::compare_labels(&old, &new);
+        let wd = Arc::new(Wikidata::new());
+        let rc = RevisionCompare::new(wd);
+        let changes = rc.compare_labels(&old, &new);
         let expected = vec![
             Change {
                 subject: ChangeSubject::Labels,
@@ -444,7 +483,9 @@ mod tests {
             "de": {"value": "alt"},
             "it": {"value":"nuovo"}}
         });
-        let changes = RevisionCompare::compare_descriptions(&old, &new);
+        let wd = Arc::new(Wikidata::new());
+        let rc = RevisionCompare::new(wd);
+        let changes = rc.compare_descriptions(&old, &new);
         let expected = vec![
             Change {
                 subject: ChangeSubject::Descriptions,
@@ -486,7 +527,9 @@ mod tests {
             "de": [{"value":"alt"}],
             "it": [{"value":"nuovo"}]}
         });
-        let changes = RevisionCompare::compare_aliases(&old, &new);
+        let wd = Arc::new(Wikidata::new());
+        let rc = RevisionCompare::new(wd);
+        let changes = rc.compare_aliases(&old, &new);
         let expected = vec![
             Change {
                 subject: ChangeSubject::Aliases,
@@ -536,7 +579,9 @@ mod tests {
             "dewiki": {"title":"alt"},
             "itwiki": {"title":"nuovo"}}
         });
-        let changes = RevisionCompare::compare_sitelinks(&old, &new);
+        let wd = Arc::new(Wikidata::new());
+        let rc = RevisionCompare::new(wd);
+        let changes = rc.compare_sitelinks(&old, &new);
         let expected = vec![
             Change {
                 subject: ChangeSubject::Sitelinks,
@@ -588,7 +633,9 @@ mod tests {
                 {"id": "Q1$128", "mainsnak": {"snaktype": "value", "datavalue": {"value": "new"}}},
             ],
         }});
-        let changes = RevisionCompare::compare_statements(&old, &new);
+        let wd = Arc::new(Wikidata::new());
+        let rc = RevisionCompare::new(wd);
+        let changes = rc.compare_statements(&old, &new);
         let expected = vec![
             Change {
                 subject: ChangeSubject::Claims,

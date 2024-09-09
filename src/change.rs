@@ -1,4 +1,4 @@
-use crate::{revision_compare::RevisionId, ItemId, TextId, WDRC};
+use crate::{revision_compare::RevisionId, ItemId, TextId, WdRc};
 use anyhow::{anyhow, Result};
 use wikimisc::{
     mysql_async::{prelude::*, Conn},
@@ -55,23 +55,20 @@ pub struct Change {
     pub title: String,
     pub property: String, // TODO numeric?
     pub id: String,
+    pub item_id: ItemId,
+    pub revision_id: RevisionId,
 }
 
 impl Change {
-    pub async fn log_statement_change(
-        &self,
-        item_id: ItemId,
-        revision_id: RevisionId,
-        conn: &mut Conn,
-    ) -> Result<()> {
-        let property = WDRC::make_id_numeric(&self.property)?;
+    pub async fn log_statement_change(&self, conn: &mut Conn) -> Result<()> {
+        let property = WdRc::make_id_numeric(&self.property)?;
         let timestamp = TimeStamp::now();
         let sql = "INSERT IGNORE INTO `statements` (`item`,`revision`,`property`,`timestamp`,`change_type`) VALUES (?,?,?,?,?)";
         conn.exec_drop(
             sql,
             (
-                item_id,
-                revision_id,
+                self.item_id,
+                self.revision_id,
                 property,
                 timestamp,
                 self.change_type.as_str(),
@@ -83,20 +80,14 @@ impl Change {
     }
 
     /// This logs labels, descriptions, aliases, and sitelinks
-    pub async fn log_label_change(
-        &self,
-        item_id: ItemId,
-        revision_id: RevisionId,
-        text_id: TextId,
-        conn: &mut Conn,
-    ) -> Result<()> {
+    pub async fn log_label_change(&self, text_id: TextId, conn: &mut Conn) -> Result<()> {
         let timestamp = TimeStamp::now();
         let sql = "INSERT IGNORE INTO `labels` (`item`,`revision`,`type`,`timestamp`,`change_type`,`language`) VALUES (?,?,?,?,?,?)";
         conn.exec_drop(
             sql,
             (
-                item_id,
-                revision_id,
+                self.item_id,
+                self.revision_id,
                 self.subject.as_str(),
                 timestamp,
                 self.change_type.as_str(),

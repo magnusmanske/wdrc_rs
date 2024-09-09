@@ -1,11 +1,10 @@
 use wikimisc::mysql_async::Row;
 
-use crate::{ItemId, WDRC};
+use crate::{ItemId, WdRc};
 
-#[derive(Debug, Clone)]
 pub struct RecentChanges {
     item_id: ItemId,
-    rc_id: u64,
+    // rc_id: u64,
     pub rc_timestamp: String,
     // pub rc_actor: u64,
     // pub rc_namespace: u64,
@@ -34,7 +33,7 @@ impl RecentChanges {
     pub fn from_row(row: Row) -> Option<RecentChanges> {
         let mut ret = RecentChanges {
             item_id: 0,
-            rc_id: row.get("rc_id")?,
+            // rc_id: row.get("rc_id")?,
             rc_timestamp: row.get("rc_timestamp")?,
             // rc_actor: row.get("rc_actor")?,
             // rc_namespace: row.get("rc_namespace")?,
@@ -58,15 +57,7 @@ impl RecentChanges {
             // rc_log_action: row.get("rc_log_action"),
             // rc_params: row.get("rc_params"),
         };
-        ret.item_id = WDRC::make_id_numeric(&ret.rc_title).ok()?;
+        ret.item_id = WdRc::make_id_numeric(&ret.rc_title).ok()?;
         Some(ret)
-    }
-
-    pub fn item_id(&self) -> u64 {
-        self.item_id
-    }
-
-    pub fn revision_id(&self) -> u64 {
-        self.rc_id
     }
 }
