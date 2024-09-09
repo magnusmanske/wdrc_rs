@@ -4,8 +4,8 @@ use crate::{
     revision_compare::{RevisionCompare, RevisionId},
 };
 use anyhow::{anyhow, Result};
-use futures::StreamExt;
-use serde_json::Value;
+use futures::{join, StreamExt};
+use serde_json::{json, Value};
 use std::{collections::HashMap, fs::File, io::BufReader, sync::Arc, time::Duration};
 use wikimisc::{
     mysql_async::{from_row, prelude::Queryable, Row},
@@ -17,7 +17,6 @@ use wikimisc::{
 pub type TextId = u64;
 pub type ItemId = u64;
 
-const CONFIG_FILE: &str = "config.json";
 const MAX_RECENT_CHANGES: u64 = 500;
 const MAX_API_CONCURRENT: usize = 50;
 
@@ -125,18 +124,22 @@ pub struct WdRc {
     text_cache: HashMap<String, usize>,
     wd: Arc<Wikidata>,
     db: ToolforgeDB,
-    _config: Value,
+    logging: bool,
     max_recent_changes: u64,
 }
 
 impl WdRc {
-    pub fn new() -> WdRc {
-        let config = Self::read_config();
+    pub fn new(config_file: &str) -> WdRc {
+        let config = Self::read_config(config_file);
         WdRc {
             text_cache: HashMap::new(),
-            _config: config.to_owned(),
             wd: Self::prepare_wd(),
             db: Self::prepare_db(&config),
+            logging: config
+                .get("logging")
+                .unwrap_or(&json!(false))
+                .as_bool()
+                .unwrap_or(false),
             max_recent_changes: config
                 .get("max_recent_changes")
                 .and_then(|j| j.as_u64())
@@ -144,15 +147,21 @@ impl WdRc {
         }
     }
 
+    fn log(&self, msg: String) {
+        if self.logging {
+            println!("{}", msg);
+        }
+    }
+
     pub async fn get_recent_changes(&self) -> Result<RecentChangesResults> {
         let oldest = self.get_key_value("timestamp").await?.unwrap_or_default();
         let results = self.get_next_recent_changes_batch(&oldest).await?;
         let rc = RecentChangesResults::new(&results);
-        println!(
+        self.log(format!(
             "New: {}, changed:{}",
             rc.new_items.len(),
             rc.changed_items.len()
-        );
+        ));
 
         // Determine and set new oldest timestamp
         Ok(rc)
@@ -234,7 +243,7 @@ impl WdRc {
             .filter_map(|r| r.ok())
             .flatten()
             .collect::<Vec<_>>();
-        println!("CHANGES: {}", changes.len());
+        self.log(format!("CHANGES: {}", changes.len()));
 
         self.log_changes(&changes).await?;
         let new_oldest = rc.get_last_rc_timetamp("20000101000000");
@@ -269,7 +278,7 @@ impl WdRc {
         if updates.is_empty() {
             return Ok(());
         }
-        println!("REDIRECTS: {} changes", updates.len());
+        self.log(format!("REDIRECTS: {} changes", updates.len()));
 
         let updates = updates.join(",");
         let sql =
@@ -323,7 +332,7 @@ impl WdRc {
         if updates.is_empty() {
             return Ok(());
         }
-        println!("DELETIONS: {} changes", updates.len());
+        self.log(format!("DELETIONS: {} changes", updates.len()));
 
         let updates = updates.join(",");
         let sql = format!("REPLACE INTO `deletions` (`q`,`timestamp`) VALUES {updates}");
@@ -359,7 +368,7 @@ impl WdRc {
             .filter_map(|c| c.get_statement_log().ok())
             .collect::<Vec<String>>();
         if !values.is_empty() {
-            let  sql = format!("INSERT IGNORE INTO `statements` (`item`,`revision`,`property`,`timestamp`,`change_type`) VALUES {}",values.join(",")) ;
+            let sql = format!("INSERT IGNORE INTO `statements` (`item`,`revision`,`property`,`timestamp`,`change_type`) VALUES {}",values.join(",")) ;
             self.db
                 .get_connection("wdrc")
                 .await?
@@ -487,10 +496,10 @@ impl WdRc {
         Ok(())
     }
 
-    fn read_config() -> Value {
-        let file = File::open(CONFIG_FILE).expect("Reading {CONFIG_FILE} failed");
+    fn read_config(config_file: &str) -> Value {
+        let file = File::open(config_file).expect("Reading {config_file} failed");
         let reader = BufReader::new(file);
-        serde_json::from_reader(reader).expect("Parsing {CONFIG_FILE} failed")
+        serde_json::from_reader(reader).expect("Parsing {config_file} failed")
     }
 
     fn prepare_wd() -> Arc<Wikidata> {
@@ -510,6 +519,20 @@ impl WdRc {
         db
     }
 
+    pub async fn run_once(&mut self) -> Result<()> {
+        let future1 = self.update_recent_deletions();
+        let future2 = self.update_recent_redirects();
+        let _ = join!(future1, future2); // Ignore errors
+
+        let rc = self.get_recent_changes().await?;
+        self.log_recent_changes(&rc).await?;
+
+        self.log_new_items(&rc).await?;
+
+        // self.purge_old_entries().await?;
+        Ok(())
+    }
+
     // pub async fn purge_old_entries(&self) -> Result<()> {
     //     todo!()
     // }
@@ -521,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_text_id() {
-        let mut wdrc = WdRc::new();
+        let mut wdrc = WdRc::new("config.json");
         let text = "aawikibooks";
         let id = wdrc.get_or_create_text_id(text).await.unwrap();
         assert_eq!(id, 1252);

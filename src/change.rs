@@ -1,9 +1,5 @@
 use crate::{revision_compare::RevisionId, ItemId, TextId, WdRc};
-use anyhow::{anyhow, Result};
-use wikimisc::{
-    mysql_async::{prelude::*, Conn},
-    timestamp::TimeStamp,
-};
+use anyhow::Result;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub enum ChangeSubject {
