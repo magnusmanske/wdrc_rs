@@ -5,6 +5,7 @@ use wikimisc::wikidata::Wikidata;
 
 use crate::{
     change::{Change, ChangeSubject, ChangeType},
+    recent_changes::ChangedItem,
     ItemId, WdRc,
 };
 
@@ -29,24 +30,25 @@ impl RevisionCompare {
 
     pub async fn run(
         &mut self,
-        q: &str,
-        rev_id_old: RevisionId,
-        rev_id_new: RevisionId,
-        timestamp: &str,
+        ci: &ChangedItem,
+        // q: &str,
+        // rev_id_old: RevisionId,
+        // rev_id_new: RevisionId,
+        // timestamp: &str,
     ) -> Result<Vec<Change>> {
-        self.item_id = WdRc::make_id_numeric(q)?;
-        self.revision_id = rev_id_new;
-        self.timestamp = timestamp.to_string();
+        self.item_id = WdRc::make_id_numeric(ci.q())?;
+        self.revision_id = ci.rev_new();
+        self.timestamp = ci.timestamp().to_string();
 
         let revisions = self
-            .get_revisions_for_item(q, rev_id_old, rev_id_new)
+            .get_revisions_for_item(ci.q(), ci.rev_old(), ci.rev_new())
             .await?;
         let rev_old = revisions
-            .get(&rev_id_old)
-            .ok_or_else(|| anyhow!("Could not load {q} old revision {rev_id_old}"))?;
+            .get(&ci.rev_old())
+            .ok_or_else(|| anyhow!("Could not load {} old revision {}", ci.q(), ci.rev_old()))?;
         let rev_new = revisions
-            .get(&rev_id_new)
-            .ok_or_else(|| anyhow!("Could not load {q} new revision {rev_id_new}"))?;
+            .get(&ci.rev_new())
+            .ok_or_else(|| anyhow!("Could not load {} new revision {}", ci.q(), ci.rev_new()))?;
         let ret = self.compare_revisions(rev_old, rev_new);
         Ok(ret)
     }

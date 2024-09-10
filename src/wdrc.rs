@@ -1,14 +1,14 @@
 use crate::{
     change::{Change, ChangeSubject},
-    recent_changes::RecentChanges,
-    revision_compare::{RevisionCompare, RevisionId},
+    recent_changes::{RecentChanges, RecentChangesResults, RecentDeletions, RecentRedirects},
+    revision_compare::RevisionCompare,
 };
 use anyhow::{anyhow, Result};
 use futures::{join, StreamExt};
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs::File, io::BufReader, sync::Arc, time::Duration};
 use wikimisc::{
-    mysql_async::{from_row, prelude::Queryable, Row},
+    mysql_async::{from_row, prelude::Queryable},
     timestamp::TimeStamp,
     toolforge_db::ToolforgeDB,
     wikidata::Wikidata,
@@ -18,106 +18,7 @@ pub type TextId = u64;
 pub type ItemId = u64;
 
 const MAX_RECENT_CHANGES: u64 = 500;
-const MAX_API_CONCURRENT: usize = 50;
-
-#[derive(Clone, Debug)]
-struct RecentRedirects {
-    source: String,
-    target: String,
-    timestamp: String,
-}
-
-impl RecentRedirects {
-    pub fn from_row(row: Row) -> Option<Self> {
-        Some(Self {
-            source: row.get("source")?,
-            target: row.get("target")?,
-            timestamp: row.get("timestamp")?,
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct RecentDeletions {
-    q: String,
-    timestamp: String,
-}
-
-impl RecentDeletions {
-    pub fn from_row(row: Row) -> Option<Self> {
-        Some(Self {
-            q: row.get("q")?,
-            timestamp: row.get("timestamp")?,
-        })
-    }
-}
-
-#[derive(Debug)]
-pub struct NewItem {
-    pub q: String,
-    pub timestamp: String,
-}
-
-#[derive(Debug)]
-pub struct ChangedItem {
-    pub q: String,
-    pub old: RevisionId,
-    pub new: RevisionId,
-    pub timestamp: String,
-}
-
-#[derive(Debug)]
-pub struct RecentChangesResults {
-    new_items: Vec<NewItem>,
-    changed_items: Vec<ChangedItem>,
-}
-
-impl RecentChangesResults {
-    fn new(results: &Vec<RecentChanges>) -> Self {
-        let mut new_items: HashMap<String, NewItem> = HashMap::new();
-        let mut changed_items: HashMap<String, ChangedItem> = HashMap::new();
-        for result in results {
-            let q = result.rc_title.clone();
-            let timestamp = result.rc_timestamp.clone();
-            if result.rc_new {
-                new_items.insert(q.clone(), NewItem { q, timestamp });
-            } else {
-                let old = result.rc_last_oldid;
-                let new = result.rc_this_oldid;
-                match changed_items.get_mut(&q) {
-                    Some(ci) => {
-                        if ci.new < new {
-                            ci.new = new;
-                        }
-                    }
-                    None => {
-                        changed_items.insert(
-                            q.clone(),
-                            ChangedItem {
-                                q,
-                                timestamp,
-                                new,
-                                old,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        Self {
-            new_items: new_items.into_values().collect(),
-            changed_items: changed_items.into_values().collect(),
-        }
-    }
-
-    /// Returns the last timestamp of the changed items, or the given oldest timestamp as fallback.
-    fn get_last_rc_timetamp(&self, oldest: &str) -> String {
-        match self.changed_items.iter().map(|r| &r.timestamp).max() {
-            Some(t) => t.to_owned(),
-            None => oldest.to_string(),
-        }
-    }
-}
+const MAX_API_CONCURRENT: u64 = 50;
 
 #[derive(Debug)]
 pub struct WdRc {
@@ -126,6 +27,7 @@ pub struct WdRc {
     db: ToolforgeDB,
     logging: bool,
     max_recent_changes: u64,
+    max_api_concurrent: usize,
 }
 
 impl WdRc {
@@ -144,6 +46,10 @@ impl WdRc {
                 .get("max_recent_changes")
                 .and_then(|j| j.as_u64())
                 .unwrap_or(MAX_RECENT_CHANGES),
+            max_api_concurrent: config
+                .get("max_api_concurrent")
+                .and_then(|j| j.as_u64())
+                .unwrap_or(MAX_API_CONCURRENT) as usize,
         }
     }
 
@@ -159,8 +65,8 @@ impl WdRc {
         let rc = RecentChangesResults::new(&results);
         self.log(format!(
             "New: {}, changed:{}",
-            rc.new_items.len(),
-            rc.changed_items.len()
+            rc.new_items().len(),
+            rc.changed_items().len()
         ));
 
         // Determine and set new oldest timestamp
@@ -195,15 +101,15 @@ impl WdRc {
     }
 
     pub async fn log_new_items(&self, rc: &RecentChangesResults) -> Result<()> {
-        if rc.new_items.is_empty() {
+        if rc.new_items().is_empty() {
             return Ok(());
         }
         let mut updates = vec![];
         let mut delete_from_deleted = vec![];
-        for new_item in &rc.new_items {
-            let q = Self::make_id_numeric(&new_item.q)?;
+        for new_item in rc.new_items() {
+            let q = Self::make_id_numeric(new_item.q())?;
             delete_from_deleted.push(format!("{q}"));
-            updates.push(format!("({q},'{}')", new_item.timestamp));
+            updates.push(format!("({q},'{}')", new_item.timestamp()));
         }
         let updates = updates.join(",");
         let delete_from_deleted = delete_from_deleted.join(",");
@@ -221,21 +127,21 @@ impl WdRc {
     }
 
     pub async fn log_recent_changes(&mut self, rc: &RecentChangesResults) -> Result<()> {
-        if rc.changed_items.is_empty() {
+        if rc.changed_items().is_empty() {
             return Ok(());
         }
         let mut rcs = vec![];
-        for _ci in &rc.changed_items {
+        for _ci in rc.changed_items() {
             let revision_compare = RevisionCompare::new(self.wd.clone());
             rcs.push(revision_compare);
         }
 
         let mut futures = vec![];
-        for (ci, revision_compare) in rc.changed_items.iter().zip(rcs.iter_mut()) {
-            let future = revision_compare.run(&ci.q, ci.old, ci.new, &ci.timestamp);
+        for (ci, revision_compare) in rc.changed_items().iter().zip(rcs.iter_mut()) {
+            let future = revision_compare.run(ci);
             futures.push(future);
         }
-        let stream = futures::stream::iter(futures).buffer_unordered(MAX_API_CONCURRENT);
+        let stream = futures::stream::iter(futures).buffer_unordered(self.max_api_concurrent);
         let changes = stream
             .collect::<Vec<_>>()
             .await
@@ -252,29 +158,7 @@ impl WdRc {
     }
 
     pub async fn update_recent_redirects(&self) -> Result<()> {
-        let oldest = self
-            .get_key_value("timestamp_redirect")
-            .await?
-            .unwrap_or_else(|| "20000101000000".to_string());
-
-        let results = self.get_recent_redirects(&oldest).await?;
-
-        let mut updates = vec![];
-        let mut new_ts = &oldest;
-        for result in &results {
-            let source = match Self::make_id_numeric(&result.source) {
-                Ok(q) => q,
-                Err(_) => continue,
-            };
-            let target = match Self::make_id_numeric(&result.target) {
-                Ok(q) => q,
-                Err(_) => continue,
-            };
-            if *new_ts < result.timestamp {
-                new_ts = &result.timestamp;
-            }
-            updates.push(format!("({source},{target},'{}')", result.timestamp));
-        }
+        let (updates, new_ts) = self.update_recent_redirects_get_updates().await?;
         if updates.is_empty() {
             return Ok(());
         }
@@ -288,8 +172,34 @@ impl WdRc {
             .await?
             .exec_drop(&sql, ())
             .await?;
-        self.set_key_value("timestamp_redirect", new_ts).await?;
+        self.set_key_value("timestamp_redirect", &new_ts).await?;
         Ok(())
+    }
+
+    async fn update_recent_redirects_get_updates(&self) -> Result<(Vec<String>, String)> {
+        let oldest = self
+            .get_key_value("timestamp_redirect")
+            .await?
+            .unwrap_or_else(|| "20000101000000".to_string());
+        let results = self.get_recent_redirects(&oldest).await?;
+        let mut updates = vec![];
+        let mut new_ts = oldest;
+        for result in &results {
+            let source = match Self::make_id_numeric(result.source()) {
+                Ok(q) => q,
+                Err(_) => continue,
+            };
+            let target = match Self::make_id_numeric(result.target()) {
+                Ok(q) => q,
+                Err(_) => continue,
+            };
+            let ts = result.timestamp().to_string();
+            if new_ts < ts {
+                new_ts = ts;
+            }
+            updates.push(format!("({source},{target},'{}')", result.timestamp()));
+        }
+        Ok((updates, new_ts))
     }
 
     async fn get_recent_redirects(&self, oldest: &String) -> Result<Vec<RecentRedirects>> {
@@ -310,25 +220,7 @@ impl WdRc {
     }
 
     pub async fn update_recent_deletions(&self) -> Result<()> {
-        let oldest = self
-            .get_key_value("timestamp_deletion")
-            .await?
-            .unwrap_or_else(|| "20000101000000".to_string());
-
-        let results = self.get_recent_deletions(&oldest).await?;
-
-        let mut updates = vec![];
-        let mut new_ts = &oldest;
-        for result in &results {
-            let q = match Self::make_id_numeric(&result.q) {
-                Ok(q) => q,
-                Err(_) => continue,
-            };
-            if *new_ts < result.timestamp {
-                new_ts = &result.timestamp;
-            }
-            updates.push(format!("({q},'{}')", result.timestamp));
-        }
+        let (updates, new_ts) = self.update_recent_deletions_get_updates().await?;
         if updates.is_empty() {
             return Ok(());
         }
@@ -341,8 +233,30 @@ impl WdRc {
             .await?
             .exec_drop(&sql, ())
             .await?;
-        self.set_key_value("timestamp_deletion", new_ts).await?;
+        self.set_key_value("timestamp_deletion", &new_ts).await?;
         Ok(())
+    }
+
+    async fn update_recent_deletions_get_updates(&self) -> Result<(Vec<String>, String)> {
+        let oldest = self
+            .get_key_value("timestamp_deletion")
+            .await?
+            .unwrap_or_else(|| "20000101000000".to_string());
+        let results = self.get_recent_deletions(&oldest).await?;
+        let mut updates = vec![];
+        let mut new_ts = oldest;
+        for result in &results {
+            let q = match Self::make_id_numeric(result.q()) {
+                Ok(q) => q,
+                Err(_) => continue,
+            };
+            let ts = result.timestamp().to_string();
+            if new_ts < ts {
+                new_ts = ts;
+            }
+            updates.push(format!("({q},'{}')", result.timestamp()));
+        }
+        Ok((updates, new_ts))
     }
 
     async fn get_recent_deletions(&self, oldest: &String) -> Result<Vec<RecentDeletions>> {
