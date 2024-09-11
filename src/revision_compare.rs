@@ -28,14 +28,7 @@ impl RevisionCompare {
         }
     }
 
-    pub async fn run(
-        &mut self,
-        ci: &ChangedItem,
-        // q: &str,
-        // rev_id_old: RevisionId,
-        // rev_id_new: RevisionId,
-        // timestamp: &str,
-    ) -> Result<Vec<Change>> {
+    pub async fn run(&mut self, ci: &ChangedItem) -> Result<Vec<Change>> {
         self.item_id = WdRc::make_id_numeric(ci.q())?;
         self.revision_id = ci.rev_new();
         self.timestamp = ci.timestamp().to_string();
@@ -97,6 +90,25 @@ impl RevisionCompare {
         Ok(revisions)
     }
 
+    fn create_label_change(
+        &self,
+        subject: &ChangeSubject,
+        change_type: ChangeType,
+        language: &str,
+        text: &str,
+    ) -> Change {
+        Change {
+            item_id: self.item_id,
+            revision_id: self.revision_id,
+            timestamp: self.timestamp.to_owned(),
+            subject: subject.to_owned(),
+            change_type,
+            language: language.to_owned(),
+            text: text.to_string(),
+            ..Default::default()
+        }
+    }
+
     fn compare_labels_descriptions(
         &self,
         rev_old: &Value,
@@ -117,28 +129,15 @@ impl RevisionCompare {
                     None => continue,
                 };
                 if label != new_label {
-                    ret.push(Change {
-                        item_id: self.item_id,
-                        revision_id: self.revision_id,
-                        timestamp: self.timestamp.to_owned(),
-                        subject: key.to_owned(),
-                        change_type: ChangeType::Changed,
-                        language: language.to_owned(),
-                        text: new_label.to_string(),
-                        ..Default::default()
-                    });
+                    ret.push(self.create_label_change(
+                        &key,
+                        ChangeType::Changed,
+                        language,
+                        new_label,
+                    ));
                 }
             } else {
-                ret.push(Change {
-                    item_id: self.item_id,
-                    revision_id: self.revision_id,
-                    timestamp: self.timestamp.to_owned(),
-                    subject: key.to_owned(),
-                    change_type: ChangeType::Removed,
-                    language: language.to_owned(),
-                    text: label.to_string(),
-                    ..Default::default()
-                });
+                ret.push(self.create_label_change(&key, ChangeType::Removed, language, label));
             }
         }
         for (language, label) in new.iter() {
@@ -147,16 +146,7 @@ impl RevisionCompare {
                     Some(label) => label,
                     None => continue,
                 };
-                ret.push(Change {
-                    item_id: self.item_id,
-                    revision_id: self.revision_id,
-                    timestamp: self.timestamp.to_owned(),
-                    subject: key.to_owned(),
-                    change_type: ChangeType::Added,
-                    language: language.to_owned(),
-                    text: label.to_string(),
-                    ..Default::default()
-                });
+                ret.push(self.create_label_change(&key, ChangeType::Added, language, label));
             }
         }
         ret
@@ -182,30 +172,22 @@ impl RevisionCompare {
         }
         for alias in old_aliases {
             if !new_aliases.contains(alias) {
-                ret.push(Change {
-                    item_id: self.item_id,
-                    revision_id: self.revision_id,
-                    timestamp: self.timestamp.to_owned(),
-                    subject: ChangeSubject::Aliases,
-                    change_type: ChangeType::Removed,
-                    language: language.to_string(),
-                    text: alias.to_string(),
-                    ..Default::default()
-                });
+                ret.push(self.create_label_change(
+                    &ChangeSubject::Aliases,
+                    ChangeType::Removed,
+                    language,
+                    alias,
+                ));
             }
         }
         for alias in new_aliases {
             if !old_aliases.contains(alias) {
-                ret.push(Change {
-                    item_id: self.item_id,
-                    revision_id: self.revision_id,
-                    timestamp: self.timestamp.to_owned(),
-                    subject: ChangeSubject::Aliases,
-                    change_type: ChangeType::Added,
-                    language: language.to_string(),
-                    text: alias.to_string(),
-                    ..Default::default()
-                });
+                ret.push(self.create_label_change(
+                    &ChangeSubject::Aliases,
+                    ChangeType::Added,
+                    language,
+                    alias,
+                ));
             }
         }
         ret
@@ -232,6 +214,19 @@ impl RevisionCompare {
         ret
     }
 
+    fn create_sitelink_change(&self, change_type: ChangeType, site: &str, title: &str) -> Change {
+        Change {
+            item_id: self.item_id,
+            revision_id: self.revision_id,
+            timestamp: self.timestamp.to_owned(),
+            subject: ChangeSubject::Sitelinks,
+            change_type,
+            site: site.to_owned(),
+            title: title.to_string(),
+            ..Default::default()
+        }
+    }
+
     fn compare_sitelinks(&self, rev_old: &Value, rev_new: &Value) -> Vec<Change> {
         let mut ret = vec![];
         let old = Self::json_object(rev_old, "sitelinks");
@@ -247,28 +242,10 @@ impl RevisionCompare {
                     None => continue,
                 };
                 if link != new_link {
-                    ret.push(Change {
-                        item_id: self.item_id,
-                        revision_id: self.revision_id,
-                        timestamp: self.timestamp.to_owned(),
-                        subject: ChangeSubject::Sitelinks,
-                        change_type: ChangeType::Changed,
-                        site: site.to_string(),
-                        title: new_link.to_string(),
-                        ..Default::default()
-                    });
+                    ret.push(self.create_sitelink_change(ChangeType::Changed, site, new_link));
                 }
             } else {
-                ret.push(Change {
-                    item_id: self.item_id,
-                    revision_id: self.revision_id,
-                    timestamp: self.timestamp.to_owned(),
-                    subject: ChangeSubject::Sitelinks,
-                    change_type: ChangeType::Removed,
-                    site: site.to_string(),
-                    title: link.to_string(),
-                    ..Default::default()
-                });
+                ret.push(self.create_sitelink_change(ChangeType::Removed, site, link));
             }
         }
         for (site, link) in new.iter() {
@@ -277,16 +254,7 @@ impl RevisionCompare {
                     Some(link) => link,
                     None => continue,
                 };
-                ret.push(Change {
-                    item_id: self.item_id,
-                    revision_id: self.revision_id,
-                    timestamp: self.timestamp.to_owned(),
-                    subject: ChangeSubject::Sitelinks,
-                    change_type: ChangeType::Added,
-                    site: site.to_string(),
-                    title: link.to_string(),
-                    ..Default::default()
-                });
+                ret.push(self.create_sitelink_change(ChangeType::Added, site, link));
             }
         }
 
@@ -304,6 +272,19 @@ impl RevisionCompare {
         None
     }
 
+    fn create_claim_change(&self, change_type: ChangeType, property: &str, id: &str) -> Change {
+        Change {
+            item_id: self.item_id,
+            revision_id: self.revision_id,
+            timestamp: self.timestamp.to_owned(),
+            subject: ChangeSubject::Claims,
+            change_type,
+            property: property.to_owned(),
+            id: id.to_string(),
+            ..Default::default()
+        }
+    }
+
     fn compare_statements(&self, rev_old: &Value, rev_new: &Value) -> Vec<Change> {
         let mut ret = vec![];
         let old_claims = Self::json_object(rev_old, "claims");
@@ -319,29 +300,11 @@ impl RevisionCompare {
                 let claim_id = claim.get("id").unwrap().as_str().unwrap();
                 let new_claim = Self::get_claim_by_id(claim_id, &new_claims);
                 if new_claim.is_none() {
-                    ret.push(Change {
-                        item_id: self.item_id,
-                        revision_id: self.revision_id,
-                        timestamp: self.timestamp.to_owned(),
-                        subject: ChangeSubject::Claims,
-                        change_type: ChangeType::Removed,
-                        property: property.to_string(),
-                        id: claim_id.to_string(),
-                        ..Default::default()
-                    });
+                    ret.push(self.create_claim_change(ChangeType::Removed, property, claim_id));
                 } else {
                     let new_claim = new_claim.unwrap();
                     if claim != &new_claim {
-                        ret.push(Change {
-                            item_id: self.item_id,
-                            revision_id: self.revision_id,
-                            timestamp: self.timestamp.to_owned(),
-                            subject: ChangeSubject::Claims,
-                            change_type: ChangeType::Changed,
-                            property: property.to_string(),
-                            id: claim_id.to_string(),
-                            ..Default::default()
-                        });
+                        ret.push(self.create_claim_change(ChangeType::Changed, property, claim_id));
                     }
                 }
             }
@@ -351,16 +314,7 @@ impl RevisionCompare {
                 let claim_id = claim.get("id").unwrap().as_str().unwrap();
                 let old_claim = Self::get_claim_by_id(claim_id, &old_claims);
                 if old_claim.is_none() {
-                    ret.push(Change {
-                        item_id: self.item_id,
-                        revision_id: self.revision_id,
-                        timestamp: self.timestamp.to_owned(),
-                        subject: ChangeSubject::Claims,
-                        change_type: ChangeType::Added,
-                        property: property.to_string(),
-                        id: claim_id.to_string(),
-                        ..Default::default()
-                    });
+                    ret.push(self.create_claim_change(ChangeType::Added, property, claim_id));
                 }
             }
         }
