@@ -74,7 +74,7 @@ impl WdRc {
     }
 
     async fn get_next_recent_changes_batch(&self, oldest: &String) -> Result<Vec<RecentChanges>> {
-        let upper_limit = TimeStamp::from_str(oldest)
+        let upper_limit = TimeStamp::str2utc(oldest)
             .map(|dt| dt + Duration::from_secs(60 * 60))
             .map(|dt| TimeStamp::datetime(&dt))
             .unwrap_or("99991231235900".to_string());
