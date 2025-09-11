@@ -14,11 +14,10 @@ pub struct RecentChanges {
     // pub rc_comment_id: String,
     // pub rc_minor: bool,
     // pub rc_bot: bool,
-    pub rc_new: bool,
+    pub rc_new: bool, // Derived from rc_source
     // pub rc_cur_id: u64,
     pub rc_this_oldid: u64,
     pub rc_last_oldid: u64,
-    // pub rc_type: u64,
     // pub rc_source: String,
     // pub rc_patrolled: bool,
     // pub rc_ip: Option<String>,
@@ -33,6 +32,7 @@ pub struct RecentChanges {
 
 impl RecentChanges {
     pub fn from_row(row: Row) -> Option<RecentChanges> {
+        let rc_source: String = row.get("rc_source")?;
         let mut ret = RecentChanges {
             item_id: 0,
             // rc_id: row.get("rc_id")?,
@@ -43,7 +43,7 @@ impl RecentChanges {
             // rc_comment_id: row.get("rc_comment_id")?,
             // rc_minor: row.get("rc_minor")?,
             // rc_bot: row.get("rc_bot")?,
-            rc_new: row.get("rc_new")?,
+            rc_new: rc_source == "mw.new",
             // rc_cur_id: row.get("rc_cur_id")?,
             rc_this_oldid: row.get("rc_this_oldid")?,
             rc_last_oldid: row.get("rc_last_oldid")?,

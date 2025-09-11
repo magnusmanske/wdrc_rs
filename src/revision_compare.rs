@@ -301,8 +301,7 @@ impl RevisionCompare {
                 let new_claim = Self::get_claim_by_id(claim_id, &new_claims);
                 if new_claim.is_none() {
                     ret.push(self.create_claim_change(ChangeType::Removed, property, claim_id));
-                } else {
-                    let new_claim = new_claim.unwrap();
+                } else if let Some(new_claim) = new_claim {
                     if claim != &new_claim {
                         ret.push(self.create_claim_change(ChangeType::Changed, property, claim_id));
                     }
