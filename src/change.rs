@@ -86,3 +86,83 @@ impl Change {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_change_subject_as_str() {
+        assert_eq!(ChangeSubject::Labels.as_str(), "labels");
+        assert_eq!(ChangeSubject::Descriptions.as_str(), "descriptions");
+        assert_eq!(ChangeSubject::Aliases.as_str(), "aliases");
+        assert_eq!(ChangeSubject::Claims.as_str(), "claims");
+        assert_eq!(ChangeSubject::Sitelinks.as_str(), "sitelinks");
+    }
+
+    #[test]
+    fn test_change_type_as_str() {
+        assert_eq!(ChangeType::Changed.as_str(), "changed");
+        assert_eq!(ChangeType::Removed.as_str(), "removed");
+        assert_eq!(ChangeType::Added.as_str(), "added");
+    }
+
+    #[test]
+    fn test_get_statement_log_valid() {
+        let change = Change {
+            item_id: 42,
+            revision_id: 100,
+            timestamp: "20240101000000".to_string(),
+            subject: ChangeSubject::Claims,
+            change_type: ChangeType::Added,
+            property: "P31".to_string(),
+            id: "Q42$abc".to_string(),
+            ..Default::default()
+        };
+        let log = change.get_statement_log().unwrap();
+        assert_eq!(log, "(42,100,31,'20240101000000','added')");
+    }
+
+    #[test]
+    fn test_get_statement_log_invalid_property() {
+        let change = Change {
+            property: "".to_string(),
+            timestamp: "20240101000000".to_string(),
+            ..Default::default()
+        };
+        assert!(change.get_statement_log().is_err());
+    }
+
+    #[test]
+    fn test_get_statement_log_invalid_timestamp() {
+        let change = Change {
+            property: "P31".to_string(),
+            timestamp: "2024-01-01".to_string(),
+            ..Default::default()
+        };
+        assert!(change.get_statement_log().is_err());
+    }
+
+    #[test]
+    fn test_get_label_log_valid() {
+        let change = Change {
+            item_id: 42,
+            revision_id: 100,
+            timestamp: "20240101000000".to_string(),
+            subject: ChangeSubject::Labels,
+            change_type: ChangeType::Changed,
+            ..Default::default()
+        };
+        let log = change.get_label_log(555).unwrap();
+        assert_eq!(log, "(42,100,'labels','20240101000000','changed',555)");
+    }
+
+    #[test]
+    fn test_get_label_log_invalid_timestamp() {
+        let change = Change {
+            timestamp: "bad'; DROP TABLE--".to_string(),
+            ..Default::default()
+        };
+        assert!(change.get_label_log(1).is_err());
+    }
+}
