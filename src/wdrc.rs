@@ -360,99 +360,127 @@ impl WdRc {
         Ok(results)
     }
 
-    async fn log_statement_changes(&self, changes: &[Change]) -> Result<()> {
+    fn build_statement_sql(changes: &[Change]) -> Option<String> {
         let values = changes
             .iter()
             .filter(|c| c.subject == ChangeSubject::Claims)
             .filter_map(|c| c.get_statement_log().ok())
             .collect::<Vec<String>>();
-        if !values.is_empty() {
-            let sql = format!("INSERT IGNORE INTO `statements` (`item`,`revision`,`property`,`timestamp`,`change_type`) VALUES {}",values.join(",")) ;
-            let timeout = self.db_timeout;
-            let db = &self.db;
-            Self::with_timeout(timeout, "log_statement_changes", async {
-                db.get_connection("wdrc").await?.exec_drop(&sql, ()).await?;
-                Ok(())
-            })
-            .await?;
+        if values.is_empty() {
+            return None;
         }
-        Ok(())
+        Some(format!("INSERT IGNORE INTO `statements` (`item`,`revision`,`property`,`timestamp`,`change_type`) VALUES {}", values.join(",")))
     }
 
-    async fn log_sitelinks_changes(&mut self, changes: &[Change]) -> Result<()> {
-        let changes: Vec<&Change> = changes
+    fn build_labels_sql(
+        changes: &[Change],
+        text_cache: &HashMap<String, TextId>,
+        key_field: impl Fn(&Change) -> &str,
+        filter: impl Fn(&Change) -> bool,
+    ) -> Option<String> {
+        let parts: Vec<String> = changes
             .iter()
-            .filter(|c| c.subject == ChangeSubject::Sitelinks)
-            .collect();
-        let mut parts = vec![];
-        for ci in changes {
-            let text_id = match self.get_or_create_text_id(&ci.site).await {
-                Ok(text_id) => text_id,
-                Err(_) => continue,
-            };
-            let part = match ci.get_label_log(text_id) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            parts.push(part);
-        }
-        if !parts.is_empty() {
-            let sql = format!(
-				"INSERT IGNORE INTO `labels` (`item`,`revision`,`type`,`timestamp`,`change_type`,`language`) VALUES {}",
-				parts.join(",")
-			);
-            let timeout = self.db_timeout;
-            let db = &self.db;
-            Self::with_timeout(timeout, "log_sitelinks_changes", async {
-                db.get_connection("wdrc").await?.exec_drop(&sql, ()).await?;
-                Ok(())
-            })
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn log_label_changes(&mut self, changes: &[Change]) -> Result<()> {
-        let changes: Vec<&Change> = changes
-            .iter()
-            .filter(|c| {
-                c.subject == ChangeSubject::Labels
-                    || c.subject == ChangeSubject::Descriptions
-                    || c.subject == ChangeSubject::Aliases
+            .filter(|c| filter(c))
+            .filter_map(|ci| {
+                let key = key_field(ci);
+                let text_id = text_cache.get(key)?;
+                ci.get_label_log(*text_id).ok()
             })
             .collect();
-        let mut parts = vec![];
-        for ci in changes {
-            let text_id = match self.get_or_create_text_id(&ci.language).await {
-                Ok(text_id) => text_id,
-                Err(_) => continue,
-            };
-            let part = match ci.get_label_log(text_id) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            parts.push(part);
+        if parts.is_empty() {
+            return None;
         }
-        if !parts.is_empty() {
-            let sql = format!(
-				"INSERT IGNORE INTO `labels` (`item`,`revision`,`type`,`timestamp`,`change_type`,`language`) VALUES {}",
-				parts.join(",")
-			);
-            let timeout = self.db_timeout;
-            let db = &self.db;
-            Self::with_timeout(timeout, "log_label_changes", async {
-                db.get_connection("wdrc").await?.exec_drop(&sql, ()).await?;
-                Ok(())
-            })
-            .await?;
-        }
-        Ok(())
+        Some(format!(
+            "INSERT IGNORE INTO `labels` (`item`,`revision`,`type`,`timestamp`,`change_type`,`language`) VALUES {}",
+            parts.join(",")
+        ))
     }
 
     async fn log_changes(&mut self, changes: &[Change]) -> Result<()> {
-        self.log_statement_changes(changes).await?;
-        self.log_sitelinks_changes(changes).await?;
-        self.log_label_changes(changes).await?;
+        // Phase 1: Ensure all text IDs are resolved (sequential, needs &mut self)
+        self.cache_texts_in_memory().await?;
+        for ci in changes {
+            match ci.subject {
+                ChangeSubject::Sitelinks => {
+                    let _ = self.get_or_create_text_id(&ci.site).await;
+                }
+                ChangeSubject::Labels | ChangeSubject::Descriptions | ChangeSubject::Aliases => {
+                    let _ = self.get_or_create_text_id(&ci.language).await;
+                }
+                _ => {}
+            }
+        }
+
+        // Phase 2: Build all SQL statements (pure computation, no I/O)
+        let stmt_sql = Self::build_statement_sql(changes);
+        let sitelinks_sql = Self::build_labels_sql(
+            changes,
+            &self.text_cache,
+            |ci| &ci.site,
+            |c| c.subject == ChangeSubject::Sitelinks,
+        );
+        let labels_sql = Self::build_labels_sql(
+            changes,
+            &self.text_cache,
+            |ci| &ci.language,
+            |c| {
+                c.subject == ChangeSubject::Labels
+                    || c.subject == ChangeSubject::Descriptions
+                    || c.subject == ChangeSubject::Aliases
+            },
+        );
+
+        // Phase 3: Execute all DB writes in parallel
+        let timeout = self.db_timeout;
+        let db = &self.db;
+
+        let stmt_fut = async {
+            if let Some(sql) = &stmt_sql {
+                Self::with_timeout(timeout, "log_statement_changes", async {
+                    db.get_connection("wdrc")
+                        .await?
+                        .exec_drop(sql.as_str(), ())
+                        .await?;
+                    Ok(())
+                })
+                .await
+            } else {
+                Ok(())
+            }
+        };
+        let sitelinks_fut = async {
+            if let Some(sql) = &sitelinks_sql {
+                Self::with_timeout(timeout, "log_sitelinks_changes", async {
+                    db.get_connection("wdrc")
+                        .await?
+                        .exec_drop(sql.as_str(), ())
+                        .await?;
+                    Ok(())
+                })
+                .await
+            } else {
+                Ok(())
+            }
+        };
+        let labels_fut = async {
+            if let Some(sql) = &labels_sql {
+                Self::with_timeout(timeout, "log_label_changes", async {
+                    db.get_connection("wdrc")
+                        .await?
+                        .exec_drop(sql.as_str(), ())
+                        .await?;
+                    Ok(())
+                })
+                .await
+            } else {
+                Ok(())
+            }
+        };
+
+        let (r1, r2, r3) = join!(stmt_fut, sitelinks_fut, labels_fut);
+        r1?;
+        r2?;
+        r3?;
         Ok(())
     }
 
