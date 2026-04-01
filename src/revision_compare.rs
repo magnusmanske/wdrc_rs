@@ -264,7 +264,7 @@ impl RevisionCompare {
     fn get_claim_by_id(claim_id: &str, claims: &Map<String, Value>) -> Option<Value> {
         for (_property, prop_claims) in claims.iter() {
             for claim in prop_claims.as_array().unwrap_or(&vec![]) {
-                if claim.get("id").unwrap().as_str().unwrap() == claim_id {
+                if claim.get("id").and_then(|v| v.as_str()) == Some(claim_id) {
                     return Some(claim.to_owned());
                 }
             }
@@ -297,7 +297,10 @@ impl RevisionCompare {
 
         for (property, prop_claims) in old_claims.iter() {
             for claim in prop_claims.as_array().unwrap_or(&vec![]) {
-                let claim_id = claim.get("id").unwrap().as_str().unwrap();
+                let claim_id = match claim.get("id").and_then(|v| v.as_str()) {
+                    Some(id) => id,
+                    None => continue,
+                };
                 let new_claim = Self::get_claim_by_id(claim_id, &new_claims);
                 if new_claim.is_none() {
                     ret.push(self.create_claim_change(ChangeType::Removed, property, claim_id));
@@ -310,7 +313,10 @@ impl RevisionCompare {
         }
         for (property, prop_claims) in new_claims.iter() {
             for claim in prop_claims.as_array().unwrap_or(&vec![]) {
-                let claim_id = claim.get("id").unwrap().as_str().unwrap();
+                let claim_id = match claim.get("id").and_then(|v| v.as_str()) {
+                    Some(id) => id,
+                    None => continue,
+                };
                 let old_claim = Self::get_claim_by_id(claim_id, &old_claims);
                 if old_claim.is_none() {
                     ret.push(self.create_claim_change(ChangeType::Added, property, claim_id));
@@ -647,5 +653,43 @@ mod tests {
             // json!({"subject": "claims","change": "added","property": "P3","id": "Q1$128"}),
         ];
         assert_eq!(changes, expected);
+    }
+
+    #[test]
+    fn test_get_claim_by_id() {
+        // Normal case: claim with valid "id" field
+        let mut claims = Map::new();
+        claims.insert(
+            "P1".to_string(),
+            json!([
+                {"id": "Q1$100", "mainsnak": {"snaktype": "value"}},
+                {"id": "Q1$101", "mainsnak": {"snaktype": "value"}},
+            ]),
+        );
+        let result = RevisionCompare::get_claim_by_id("Q1$101", &claims);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()["id"], "Q1$101");
+
+        // Claim missing the "id" field entirely — should return None, not panic
+        let mut claims_no_id = Map::new();
+        claims_no_id.insert(
+            "P1".to_string(),
+            json!([
+                {"mainsnak": {"snaktype": "value"}},
+            ]),
+        );
+        let result = RevisionCompare::get_claim_by_id("Q1$100", &claims_no_id);
+        assert!(result.is_none());
+
+        // Claim where "id" is not a string — should return None, not panic
+        let mut claims_bad_id = Map::new();
+        claims_bad_id.insert(
+            "P1".to_string(),
+            json!([
+                {"id": 12345, "mainsnak": {"snaktype": "value"}},
+            ]),
+        );
+        let result = RevisionCompare::get_claim_by_id("12345", &claims_bad_id);
+        assert!(result.is_none());
     }
 }
