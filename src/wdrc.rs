@@ -22,7 +22,7 @@ const MAX_API_CONCURRENT: u64 = 50;
 
 #[derive(Debug)]
 pub struct WdRc {
-    text_cache: HashMap<String, usize>,
+    text_cache: HashMap<String, TextId>,
     wd: Arc<Wikidata>,
     db: ToolforgeDB,
     logging: bool,
@@ -364,7 +364,7 @@ impl WdRc {
     async fn get_or_create_text_id(&mut self, text: &str) -> Result<TextId> {
         self.cache_texts_in_memory().await?;
         match self.text_cache.get(text) {
-            Some(id) => Ok(*id as TextId),
+            Some(id) => Ok(*id),
             None => {
                 let sql = "INSERT INTO `texts` (`value`) VALUES (?)";
                 let mut conn = self.db.get_connection("wdrc").await?;
@@ -374,7 +374,7 @@ impl WdRc {
                 let id = conn
                     .last_insert_id()
                     .ok_or_else(|| anyhow!("No text row inserted"))?;
-                self.text_cache.insert(text.to_string(), id as usize);
+                self.text_cache.insert(text.to_string(), id);
                 Ok(id)
             }
         }
@@ -384,10 +384,10 @@ impl WdRc {
         if self.text_cache.is_empty() {
             let sql = "SELECT `value`,`id` FROM `texts`";
             let mut conn = self.db.get_connection("wdrc").await?;
-            let result: Vec<(String, usize)> = conn
+            let result: Vec<(String, TextId)> = conn
                 .exec_iter(sql, ())
                 .await?
-                .map_and_drop(from_row::<(String, usize)>)
+                .map_and_drop(from_row::<(String, TextId)>)
                 .await?;
             self.text_cache = result.into_iter().collect();
         }
