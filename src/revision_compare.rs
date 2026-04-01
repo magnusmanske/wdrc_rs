@@ -69,7 +69,7 @@ impl RevisionCompare {
         };
         let pages = Self::json_object(pages, "pages");
         for page in pages.values() {
-            for revision in Self::json_array(page, "revisions") {
+            for revision in Self::json_array(page, "revisions").iter() {
                 if let Some(rev_id) = revision["revid"].as_u64() {
                     if rev_id == rev_id_old || rev_id == rev_id_new {
                         if let Some(text) = revision["slots"]["main"]["*"].as_str() {
@@ -130,7 +130,7 @@ impl RevisionCompare {
         let mut ret = vec![];
         let old = Self::json_object(rev_old, key.as_str());
         let new = Self::json_object(rev_new, key.as_str());
-        for (language, label) in old.iter() {
+        for (language, label) in old {
             let label = match label["value"].as_str() {
                 Some(label) => label,
                 None => continue,
@@ -152,7 +152,7 @@ impl RevisionCompare {
                 ret.push(self.create_label_change(&key, ChangeType::Removed, language, label));
             }
         }
-        for (language, label) in new.iter() {
+        for (language, label) in new {
             if !old.contains_key(language) {
                 let label = match label["value"].as_str() {
                     Some(label) => label,
@@ -209,7 +209,8 @@ impl RevisionCompare {
         let mut ret = vec![];
         let old = Self::json_object(rev_old, "aliases");
         let new = Self::json_object(rev_new, "aliases");
-        let all_languages: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+        let all_languages: BTreeSet<&str> =
+            old.keys().chain(new.keys()).map(|s| s.as_str()).collect();
 
         for language in all_languages {
             let old_aliases = Self::extract_aliases_from_map(&old, language);
@@ -236,7 +237,7 @@ impl RevisionCompare {
         let mut ret = vec![];
         let old = Self::json_object(rev_old, "sitelinks");
         let new = Self::json_object(rev_new, "sitelinks");
-        for (site, link) in old.iter() {
+        for (site, link) in old {
             let link = match link["title"].as_str() {
                 Some(link) => link,
                 None => continue,
@@ -253,7 +254,7 @@ impl RevisionCompare {
                 ret.push(self.create_sitelink_change(ChangeType::Removed, site, link));
             }
         }
-        for (site, link) in new.iter() {
+        for (site, link) in new {
             if !old.contains_key(site) {
                 let link = match link["title"].as_str() {
                     Some(link) => link,
@@ -282,7 +283,7 @@ impl RevisionCompare {
         claims: &'a Map<String, Value>,
     ) -> HashMap<&'a str, (&'a str, &'a Value)> {
         let mut index = HashMap::new();
-        for (property, prop_claims) in claims.iter() {
+        for (property, prop_claims) in claims {
             if let Some(arr) = prop_claims.as_array() {
                 for claim in arr {
                     if let Some(id) = claim.get("id").and_then(|v| v.as_str()) {
@@ -313,8 +314,8 @@ impl RevisionCompare {
         let new_claims = Self::json_object(rev_new, "claims");
 
         // Build O(1) lookup indexes instead of scanning all claims per lookup
-        let old_index = Self::build_claim_index(&old_claims);
-        let new_index = Self::build_claim_index(&new_claims);
+        let old_index = Self::build_claim_index(old_claims);
+        let new_index = Self::build_claim_index(new_claims);
 
         // Find removed and changed claims
         for (claim_id, (property, old_claim)) in &old_index {
@@ -350,31 +351,20 @@ impl RevisionCompare {
         ret
     }
 
-    fn json_object(j: &Value, key: &str) -> Map<String, Value> {
-        let o = match j.get(key) {
-            Some(v) => v,
-            None => return serde_json::Map::new(),
-        };
-        o.as_object()
-            .map(|v| v.to_owned())
-            .unwrap_or(serde_json::Map::new())
+    fn json_object<'a>(j: &'a Value, key: &str) -> &'a Map<String, Value> {
+        static EMPTY_MAP: std::sync::LazyLock<Map<String, Value>> =
+            std::sync::LazyLock::new(Map::new);
+        j.get(key).and_then(|v| v.as_object()).unwrap_or(&EMPTY_MAP)
     }
 
-    fn json_array(j: &Value, key: &str) -> Vec<Value> {
-        let o = match j.get(key) {
-            Some(v) => v,
-            None => return vec![],
-        };
-        o.as_array().map(|v| v.to_owned()).unwrap_or(vec![])
+    fn json_array<'a>(j: &'a Value, key: &str) -> &'a Vec<Value> {
+        static EMPTY_VEC: std::sync::LazyLock<Vec<Value>> = std::sync::LazyLock::new(Vec::new);
+        j.get(key).and_then(|v| v.as_array()).unwrap_or(&EMPTY_VEC)
     }
 
     fn extract_aliases_from_map(aliases: &Map<String, Value>, language: &str) -> Vec<String> {
-        let aliases = aliases
-            .get(language)
-            .map(|v| v.to_owned())
-            .unwrap_or(json!([]));
-        let aliases = match aliases.as_array() {
-            Some(aliases) => aliases,
+        let aliases = match aliases.get(language).and_then(|v| v.as_array()) {
+            Some(arr) => arr,
             None => return vec![],
         };
         let aliases: Vec<String> = aliases
