@@ -5,7 +5,7 @@ use wikimisc::mysql_async::Row;
 use crate::{revision_compare::RevisionId, ItemId, WdRc};
 
 pub struct RecentChanges {
-    item_id: ItemId,
+    pub(crate) item_id: ItemId,
     // rc_id: u64,
     pub rc_timestamp: String,
     // pub rc_actor: u64,
@@ -129,6 +129,9 @@ impl RecentChangesResults {
                         if ci.new < new {
                             ci.new = new;
                         }
+                        if ci.old > old {
+                            ci.old = old;
+                        }
                     }
                     None => {
                         changed_items.insert(
@@ -216,5 +219,61 @@ impl RecentDeletions {
 
     pub fn timestamp(&self) -> &str {
         &self.timestamp
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_rc(title: &str, rc_new: bool, last_oldid: u64, this_oldid: u64) -> RecentChanges {
+        RecentChanges {
+            item_id: 0,
+            rc_timestamp: "20240101000000".to_string(),
+            rc_title: title.to_string(),
+            rc_new,
+            rc_this_oldid: this_oldid,
+            rc_last_oldid: last_oldid,
+        }
+    }
+
+    #[test]
+    fn test_changed_items_tracks_minimum_old_revision() {
+        // Results arrive in reverse order: newer change first, older change second.
+        // rev 101->102 arrives before rev 100->101.
+        let results = vec![
+            make_rc("Q42", false, 101, 102),
+            make_rc("Q42", false, 100, 101),
+        ];
+        let rcr = RecentChangesResults::new(&results);
+        assert_eq!(rcr.changed_items().len(), 1);
+        let ci = &rcr.changed_items()[0];
+        assert_eq!(ci.q(), "Q42");
+        assert_eq!(ci.rev_old(), 100, "old should be the minimum old revision");
+        assert_eq!(ci.rev_new(), 102, "new should be the maximum new revision");
+    }
+
+    #[test]
+    fn test_changed_items_in_order() {
+        // Results arrive in natural order: older change first.
+        let results = vec![
+            make_rc("Q42", false, 100, 101),
+            make_rc("Q42", false, 101, 102),
+        ];
+        let rcr = RecentChangesResults::new(&results);
+        assert_eq!(rcr.changed_items().len(), 1);
+        let ci = &rcr.changed_items()[0];
+        assert_eq!(ci.q(), "Q42");
+        assert_eq!(ci.rev_old(), 100);
+        assert_eq!(ci.rev_new(), 102);
+    }
+
+    #[test]
+    fn test_new_items_are_tracked() {
+        let results = vec![make_rc("Q99", true, 0, 50)];
+        let rcr = RecentChangesResults::new(&results);
+        assert_eq!(rcr.new_items().len(), 1);
+        assert_eq!(rcr.new_items()[0].q(), "Q99");
+        assert!(rcr.changed_items().is_empty());
     }
 }
