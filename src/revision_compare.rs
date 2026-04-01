@@ -1,6 +1,10 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Map, Value};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 use wikimisc::wikidata::Wikidata;
 
 /// Timeout for a single Wikidata API revision fetch.
@@ -205,19 +209,12 @@ impl RevisionCompare {
         let mut ret = vec![];
         let old = Self::json_object(rev_old, "aliases");
         let new = Self::json_object(rev_new, "aliases");
-        let mut all_languages: Vec<String> = old.keys().map(|s| s.to_owned()).collect();
-        all_languages.append(&mut new.keys().map(|s| s.to_owned()).collect());
-        all_languages.sort();
-        all_languages.dedup();
+        let all_languages: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
 
         for language in all_languages {
-            let old_aliases = Self::extract_aliases_from_map(&old, &language);
-            let new_aliases = Self::extract_aliases_from_map(&new, &language);
-            ret.append(&mut self.compare_aliases_in_language(
-                &language,
-                &old_aliases,
-                &new_aliases,
-            ));
+            let old_aliases = Self::extract_aliases_from_map(&old, language);
+            let new_aliases = Self::extract_aliases_from_map(&new, language);
+            ret.append(&mut self.compare_aliases_in_language(language, &old_aliases, &new_aliases));
         }
         ret
     }
@@ -363,7 +360,7 @@ impl RevisionCompare {
         o.as_array().map(|v| v.to_owned()).unwrap_or(vec![])
     }
 
-    fn extract_aliases_from_map(aliases: &Map<String, Value>, language: &String) -> Vec<String> {
+    fn extract_aliases_from_map(aliases: &Map<String, Value>, language: &str) -> Vec<String> {
         let aliases = aliases
             .get(language)
             .map(|v| v.to_owned())
