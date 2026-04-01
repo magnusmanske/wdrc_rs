@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
@@ -213,8 +213,8 @@ impl RevisionCompare {
             old.keys().chain(new.keys()).map(|s| s.as_str()).collect();
 
         for language in all_languages {
-            let old_aliases = Self::extract_aliases_from_map(&old, language);
-            let new_aliases = Self::extract_aliases_from_map(&new, language);
+            let old_aliases = Self::extract_aliases_from_map(old, language);
+            let new_aliases = Self::extract_aliases_from_map(new, language);
             ret.append(&mut self.compare_aliases_in_language(language, &old_aliases, &new_aliases));
         }
         ret
@@ -267,6 +267,7 @@ impl RevisionCompare {
         ret
     }
 
+    #[cfg(test)]
     fn get_claim_by_id(claim_id: &str, claims: &Map<String, Value>) -> Option<Value> {
         for (_property, prop_claims) in claims.iter() {
             for claim in prop_claims.as_array().unwrap_or(&vec![]) {
@@ -279,9 +280,7 @@ impl RevisionCompare {
     }
 
     /// Build a HashMap from claim ID to (property, claim Value) for O(1) lookups.
-    fn build_claim_index<'a>(
-        claims: &'a Map<String, Value>,
-    ) -> HashMap<&'a str, (&'a str, &'a Value)> {
+    fn build_claim_index(claims: &Map<String, Value>) -> HashMap<&str, (&str, &Value)> {
         let mut index = HashMap::new();
         for (property, prop_claims) in claims {
             if let Some(arr) = prop_claims.as_array() {
@@ -379,6 +378,7 @@ impl RevisionCompare {
 #[cfg(test)]
 mod tests {
     use crate::change::{Change, ChangeSubject, ChangeType};
+    use serde_json::json;
 
     use super::*;
 
