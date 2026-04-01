@@ -1,7 +1,10 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Map, Value};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use wikimisc::wikidata::Wikidata;
+
+/// Timeout for a single Wikidata API revision fetch.
+const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::{
     change::{Change, ChangeSubject, ChangeType},
@@ -85,7 +88,12 @@ impl RevisionCompare {
     ) -> Result<HashMap<RevisionId, Value>> {
         let url = Self::get_revisions_url(q, rev_id_old, rev_id_new);
         let client = self.wd.reqwest_client()?;
-        let j = client.get(url).send().await?.json().await?;
+        let j: Value = tokio::time::timeout(API_REQUEST_TIMEOUT, async {
+            let resp = client.get(&url).send().await?;
+            resp.json().await.map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(|_| anyhow!("API request timed out after {API_REQUEST_TIMEOUT:?} for {q}"))??;
         let revisions = Self::extract_revisions(rev_id_old, rev_id_new, &j);
         Ok(revisions)
     }
