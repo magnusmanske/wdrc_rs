@@ -184,20 +184,30 @@ impl WdRc {
         let updates = updates.join(",");
         let delete_from_deleted = delete_from_deleted.join(",");
 
-        // Write changes to DB
+        // Write changes to DB in parallel (different tables, no ordering dependency)
         let timeout = self.db_timeout;
         let db = &self.db;
-        Self::with_timeout(timeout, "log_new_items", async {
-            let mut conn = db.get_connection("wdrc").await?;
+        let create_sql = format!("REPLACE INTO `creations` (`q`,`timestamp`) VALUES {updates}");
+        let delete_sql = format!("DELETE FROM `deletions` WHERE `q` IN ({delete_from_deleted})");
 
-            let sql = format!("REPLACE INTO `creations` (`q`,`timestamp`) VALUES {updates}");
-            conn.exec_drop(&sql, ()).await?;
-
-            let sql = format!("DELETE FROM `deletions` WHERE `q` IN  ({delete_from_deleted})");
-            conn.exec_drop(&sql, ()).await?;
+        let create_fut = Self::with_timeout(timeout, "log_new_items/creations", async {
+            db.get_connection("wdrc")
+                .await?
+                .exec_drop(&create_sql, ())
+                .await?;
             Ok(())
-        })
-        .await
+        });
+        let delete_fut = Self::with_timeout(timeout, "log_new_items/deletions", async {
+            db.get_connection("wdrc")
+                .await?
+                .exec_drop(&delete_sql, ())
+                .await?;
+            Ok(())
+        });
+        let (r1, r2) = join!(create_fut, delete_fut);
+        r1?;
+        r2?;
+        Ok(())
     }
 
     pub async fn log_recent_changes(&mut self, rc: &RecentChangesResults) -> Result<()> {
