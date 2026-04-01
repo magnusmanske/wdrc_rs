@@ -362,7 +362,7 @@ impl WdRc {
     }
 
     async fn get_or_create_text_id(&mut self, text: &str) -> Result<TextId> {
-        self.chache_texts_in_memory().await?;
+        self.cache_texts_in_memory().await?;
         match self.text_cache.get(text) {
             Some(id) => Ok(*id as TextId),
             None => {
@@ -380,7 +380,7 @@ impl WdRc {
         }
     }
 
-    async fn chache_texts_in_memory(&mut self) -> Result<()> {
+    async fn cache_texts_in_memory(&mut self) -> Result<()> {
         if self.text_cache.is_empty() {
             let sql = "SELECT `value`,`id` FROM `texts`";
             let mut conn = self.db.get_connection("wdrc").await?;
