@@ -215,8 +215,8 @@ impl WdRc {
             .await?
             .map_and_drop(RecentRedirects::from_row)
             .await?
-            .iter()
-            .filter_map(|r| r.to_owned())
+            .into_iter()
+            .flatten()
             .collect();
         Ok(results)
     }
@@ -271,8 +271,8 @@ impl WdRc {
             .await?
             .map_and_drop(RecentDeletions::from_row)
             .await?
-            .iter()
-            .filter_map(|r| r.to_owned())
+            .into_iter()
+            .flatten()
             .collect();
         Ok(results)
     }
