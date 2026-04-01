@@ -413,9 +413,11 @@ impl WdRc {
     }
 
     fn read_config(config_file: &str) -> Value {
-        let file = File::open(config_file).expect("Reading {config_file} failed");
+        let file =
+            File::open(config_file).unwrap_or_else(|e| panic!("Reading {config_file} failed: {e}"));
         let reader = BufReader::new(file);
-        serde_json::from_reader(reader).expect("Parsing {config_file} failed")
+        serde_json::from_reader(reader)
+            .unwrap_or_else(|e| panic!("Parsing {config_file} failed: {e}"))
     }
 
     fn prepare_wd() -> Arc<Wikidata> {
