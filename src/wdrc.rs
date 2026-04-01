@@ -214,25 +214,19 @@ impl WdRc {
         if rc.changed_items().is_empty() {
             return Ok(());
         }
-        let mut rcs = vec![];
-        for _ci in rc.changed_items() {
-            let revision_compare = RevisionCompare::new(self.wd.clone());
-            rcs.push(revision_compare);
-        }
-
-        let mut futures = vec![];
-        for (ci, revision_compare) in rc.changed_items().iter().zip(rcs.iter_mut()) {
-            let future = revision_compare.run(ci);
-            futures.push(future);
-        }
+        let wd = self.wd.clone();
+        let futures = rc.changed_items().iter().map(|ci| {
+            let mut revision_compare = RevisionCompare::new(wd.clone());
+            async move { revision_compare.run(ci).await }
+        });
         let stream = futures::stream::iter(futures).buffer_unordered(self.max_api_concurrent);
-        let changes = stream
+        let changes: Vec<Change> = stream
             .collect::<Vec<_>>()
             .await
             .into_iter()
             .filter_map(|r| r.ok())
             .flatten()
-            .collect::<Vec<_>>();
+            .collect();
         self.log(format!("CHANGES: {}", changes.len()));
 
         self.log_changes(&changes).await?;
