@@ -22,7 +22,8 @@ async fn main() {
         let sleep_duration = wdrc.bot_sleep();
         loop {
             match wdrc.run_once().await {
-                Ok(_) => (),
+                Ok(RunResult::MoreWork) => continue,
+                Ok(RunResult::CaughtUp) => (),
                 Err(e) => eprintln!("Error: {}", e),
             }
             tokio::time::sleep(sleep_duration).await;

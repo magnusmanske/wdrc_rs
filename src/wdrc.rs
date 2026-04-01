@@ -17,6 +17,15 @@ use wikimisc::{
 pub type TextId = u64;
 pub type ItemId = u64;
 
+/// Returned from `run_once` to indicate whether the bot should sleep or immediately process more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunResult {
+    /// The batch was full — there is likely more work waiting. Don't sleep.
+    MoreWork,
+    /// The batch was not full — we've caught up. Sleep before next iteration.
+    CaughtUp,
+}
+
 const MAX_RECENT_CHANGES: u64 = 500;
 const MAX_API_CONCURRENT: u64 = 50;
 /// Default timeout for individual DB queries (seconds)
@@ -583,23 +592,35 @@ impl WdRc {
         db
     }
 
-    pub async fn run_once(&mut self) -> Result<()> {
+    pub async fn run_once(&mut self) -> Result<RunResult> {
         let run_timeout = self.run_timeout;
         Self::with_timeout(run_timeout, "run_once", self.run_once_inner()).await
     }
 
-    async fn run_once_inner(&mut self) -> Result<()> {
+    async fn run_once_inner(&mut self) -> Result<RunResult> {
         let future1 = self.update_recent_deletions();
         let future2 = self.update_recent_redirects();
-        let _ = join!(future1, future2); // Ignore errors
+        let (r1, r2) = join!(future1, future2);
+        if let Err(e) = r1 {
+            eprintln!("update_recent_deletions error: {e}");
+        }
+        if let Err(e) = r2 {
+            eprintln!("update_recent_redirects error: {e}");
+        }
 
         let rc = self.get_recent_changes().await?;
-        self.log_recent_changes(&rc).await?;
+        let batch_full =
+            rc.changed_items().len() + rc.new_items().len() >= self.max_recent_changes as usize;
 
+        self.log_recent_changes(&rc).await?;
         self.log_new_items(&rc).await?;
 
         // self.purge_old_entries().await?;
-        Ok(())
+        Ok(if batch_full {
+            RunResult::MoreWork
+        } else {
+            RunResult::CaughtUp
+        })
     }
 
     // pub async fn purge_old_entries(&self) -> Result<()> {
