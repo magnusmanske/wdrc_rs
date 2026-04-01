@@ -113,7 +113,7 @@ pub struct RecentChangesResults {
 }
 
 impl RecentChangesResults {
-    pub fn new(results: &Vec<RecentChanges>) -> Self {
+    pub fn new(results: &[RecentChanges]) -> Self {
         let mut new_items: HashMap<String, NewItem> = HashMap::new();
         let mut changed_items: HashMap<String, ChangedItem> = HashMap::new();
         for result in results {

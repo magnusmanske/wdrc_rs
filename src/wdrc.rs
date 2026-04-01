@@ -73,7 +73,7 @@ impl WdRc {
         Ok(rc)
     }
 
-    async fn get_next_recent_changes_batch(&self, oldest: &String) -> Result<Vec<RecentChanges>> {
+    async fn get_next_recent_changes_batch(&self, oldest: &str) -> Result<Vec<RecentChanges>> {
         let upper_limit = TimeStamp::str2utc(oldest)
             .map(|dt| dt + Duration::from_secs(60 * 60))
             .map(|dt| TimeStamp::datetime(&dt))
@@ -204,7 +204,7 @@ impl WdRc {
         Ok((updates, new_ts))
     }
 
-    async fn get_recent_redirects(&self, oldest: &String) -> Result<Vec<RecentRedirects>> {
+    async fn get_recent_redirects(&self, oldest: &str) -> Result<Vec<RecentRedirects>> {
         let sql = "SELECT `rc_title` AS `source`,`rd_title` AS `target`,max(`rc_timestamp`) AS `timestamp` FROM `recentchanges`,`redirect`
 			WHERE `rc_namespace`=0 AND `rd_from`=`rc_cur_id` AND `rd_namespace`=0 AND `rc_timestamp`>=? GROUP BY `source`,`target`";
         let results: Vec<RecentRedirects> = self
@@ -261,7 +261,7 @@ impl WdRc {
         Ok((updates, new_ts))
     }
 
-    async fn get_recent_deletions(&self, oldest: &String) -> Result<Vec<RecentDeletions>> {
+    async fn get_recent_deletions(&self, oldest: &str) -> Result<Vec<RecentDeletions>> {
         let sql = "SELECT `log_title` AS `q`,`log_timestamp` AS `timestamp` FROM `logging` WHERE `log_type`='delete' AND `log_action`='delete' AND `log_timestamp`>=? AND `log_namespace`=0";
         let results: Vec<RecentDeletions> = self
             .db

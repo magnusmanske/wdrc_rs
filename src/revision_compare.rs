@@ -163,8 +163,8 @@ impl RevisionCompare {
     fn compare_aliases_in_language(
         &self,
         language: &str,
-        old_aliases: &Vec<String>,
-        new_aliases: &Vec<String>,
+        old_aliases: &[String],
+        new_aliases: &[String],
     ) -> Vec<Change> {
         let mut ret = vec![];
         if old_aliases == new_aliases {
