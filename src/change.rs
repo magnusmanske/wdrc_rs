@@ -59,6 +59,9 @@ pub struct Change {
 impl Change {
     pub fn get_statement_log(&self) -> Result<String> {
         let property = WdRc::make_id_numeric(&self.property)?;
+        if !self.timestamp.chars().all(|c| c.is_ascii_digit()) {
+            return Err(anyhow::anyhow!("Invalid timestamp: {:?}", self.timestamp));
+        }
         Ok(format!(
             "({},{},{property},'{}','{}')",
             self.item_id,
@@ -68,8 +71,11 @@ impl Change {
         ))
     }
 
-    pub fn get_label_log(&self, text_id: TextId) -> String {
-        format!(
+    pub fn get_label_log(&self, text_id: TextId) -> Result<String> {
+        if !self.timestamp.chars().all(|c| c.is_ascii_digit()) {
+            return Err(anyhow::anyhow!("Invalid timestamp: {:?}", self.timestamp));
+        }
+        Ok(format!(
             "({},{},'{}','{}','{}',{})",
             self.item_id,
             self.revision_id,
@@ -77,6 +83,6 @@ impl Change {
             self.timestamp,
             self.change_type.as_str(),
             text_id
-        )
+        ))
     }
 }

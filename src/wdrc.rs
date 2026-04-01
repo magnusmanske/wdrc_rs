@@ -91,6 +91,14 @@ impl WdRc {
         Ok(results)
     }
 
+    pub(crate) fn sanitize_timestamp(ts: &str) -> Result<&str> {
+        if ts.chars().all(|c| c.is_ascii_digit()) {
+            Ok(ts)
+        } else {
+            Err(anyhow!("Invalid timestamp: {ts:?}"))
+        }
+    }
+
     pub fn make_id_numeric(id: &str) -> Result<ItemId> {
         if id.len() < 2 {
             return Err(anyhow!("Bad ID: {id:?}"));
@@ -110,8 +118,12 @@ impl WdRc {
         let mut delete_from_deleted = vec![];
         for new_item in rc.new_items() {
             let q = Self::make_id_numeric(new_item.q())?;
+            let ts = new_item.timestamp();
+            if Self::sanitize_timestamp(ts).is_err() {
+                continue;
+            }
             delete_from_deleted.push(format!("{q}"));
-            updates.push(format!("({q},'{}')", new_item.timestamp()));
+            updates.push(format!("({q},'{ts}')"));
         }
         let updates = updates.join(",");
         let delete_from_deleted = delete_from_deleted.join(",");
@@ -199,6 +211,9 @@ impl WdRc {
             if new_ts < ts {
                 new_ts = ts;
             }
+            if Self::sanitize_timestamp(result.timestamp()).is_err() {
+                continue;
+            }
             updates.push(format!("({source},{target},'{}')", result.timestamp()));
         }
         Ok((updates, new_ts))
@@ -256,6 +271,9 @@ impl WdRc {
             if new_ts < ts {
                 new_ts = ts;
             }
+            if Self::sanitize_timestamp(result.timestamp()).is_err() {
+                continue;
+            }
             updates.push(format!("({q},'{}')", result.timestamp()));
         }
         Ok((updates, new_ts))
@@ -305,7 +323,10 @@ impl WdRc {
                 Ok(text_id) => text_id,
                 Err(_) => continue,
             };
-            let part = ci.get_label_log(text_id);
+            let part = match ci.get_label_log(text_id) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             parts.push(part);
         }
         if !parts.is_empty() {
@@ -337,7 +358,10 @@ impl WdRc {
                 Ok(text_id) => text_id,
                 Err(_) => continue,
             };
-            let part = ci.get_label_log(text_id);
+            let part = match ci.get_label_log(text_id) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             parts.push(part);
         }
         if !parts.is_empty() {
@@ -466,6 +490,14 @@ mod tests {
         let text = "aawikibooks";
         let id = wdrc.get_or_create_text_id(text).await.unwrap();
         assert_eq!(id, 1252);
+    }
+
+    #[test]
+    fn test_sanitize_timestamp() {
+        assert!(WdRc::sanitize_timestamp("20231231235959").is_ok());
+        assert!(WdRc::sanitize_timestamp("").is_ok()); // empty is technically valid
+        assert!(WdRc::sanitize_timestamp("2023-12-31").is_err());
+        assert!(WdRc::sanitize_timestamp("'; DROP TABLE--").is_err());
     }
 
     #[test]
