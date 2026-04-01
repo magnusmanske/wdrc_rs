@@ -19,11 +19,13 @@ async fn main() {
     let mut wdrc = WdRc::new(&config_file);
 
     if command == "bot" {
+        let sleep_duration = wdrc.bot_sleep();
         loop {
             match wdrc.run_once().await {
                 Ok(_) => (),
                 Err(e) => eprintln!("Error: {}", e),
             }
+            tokio::time::sleep(sleep_duration).await;
         }
     } else if command == "run" {
         match wdrc.run_once().await {

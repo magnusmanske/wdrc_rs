@@ -19,6 +19,12 @@ pub type ItemId = u64;
 
 const MAX_RECENT_CHANGES: u64 = 500;
 const MAX_API_CONCURRENT: u64 = 50;
+/// Default timeout for individual DB queries (seconds)
+const DEFAULT_DB_TIMEOUT_SEC: u64 = 300;
+/// Default timeout for entire run_once cycle (seconds)
+const DEFAULT_RUN_TIMEOUT_SEC: u64 = 600;
+/// Default sleep between bot loop iterations (seconds)
+const DEFAULT_BOT_SLEEP_SEC: u64 = 10;
 
 #[derive(Debug)]
 pub struct WdRc {
@@ -28,11 +34,26 @@ pub struct WdRc {
     logging: bool,
     max_recent_changes: u64,
     max_api_concurrent: usize,
+    db_timeout: Duration,
+    run_timeout: Duration,
+    bot_sleep: Duration,
 }
 
 impl WdRc {
     pub fn new(config_file: &str) -> WdRc {
         let config = Self::read_config(config_file);
+        let db_timeout_sec = config
+            .get("db_timeout_sec")
+            .and_then(|j| j.as_u64())
+            .unwrap_or(DEFAULT_DB_TIMEOUT_SEC);
+        let run_timeout_sec = config
+            .get("run_timeout_sec")
+            .and_then(|j| j.as_u64())
+            .unwrap_or(DEFAULT_RUN_TIMEOUT_SEC);
+        let bot_sleep_sec = config
+            .get("bot_sleep_sec")
+            .and_then(|j| j.as_u64())
+            .unwrap_or(DEFAULT_BOT_SLEEP_SEC);
         WdRc {
             text_cache: HashMap::new(),
             wd: Self::prepare_wd(),
@@ -50,12 +71,32 @@ impl WdRc {
                 .get("max_api_concurrent")
                 .and_then(|j| j.as_u64())
                 .unwrap_or(MAX_API_CONCURRENT) as usize,
+            db_timeout: Duration::from_secs(db_timeout_sec),
+            run_timeout: Duration::from_secs(run_timeout_sec),
+            bot_sleep: Duration::from_secs(bot_sleep_sec),
         }
     }
 
     fn log(&self, msg: String) {
         if self.logging {
             println!("{}", msg);
+        }
+    }
+
+    /// Returns the configured sleep duration between bot loop iterations.
+    pub fn bot_sleep(&self) -> Duration {
+        self.bot_sleep
+    }
+
+    /// Wraps an async operation with a timeout, returning an error if it exceeds `duration`.
+    async fn with_timeout<T>(
+        duration: Duration,
+        label: &str,
+        fut: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        match tokio::time::timeout(duration, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("Timeout after {:?} in {}", duration, label)),
         }
     }
 
@@ -79,16 +120,22 @@ impl WdRc {
             .map(|dt| TimeStamp::datetime(&dt))
             .unwrap_or("99991231235900".to_string());
         let sql = "SELECT * FROM `recentchanges` WHERE `rc_namespace`=0 AND `rc_timestamp`>=? AND rc_timestamp<=? ORDER BY `rc_timestamp`,`rc_title`,`rc_id` LIMIT ?";
-        let mut conn = self.db.get_connection("wikidata").await?;
-        let results: Vec<RecentChanges> = conn
-            .exec_iter(sql, (oldest, &upper_limit, &self.max_recent_changes))
-            .await?
-            .map_and_drop(RecentChanges::from_row)
-            .await?
-            .into_iter()
-            .flatten()
-            .collect();
-        Ok(results)
+        let timeout = self.db_timeout;
+        let db = &self.db;
+        let max_rc = &self.max_recent_changes;
+        Self::with_timeout(timeout, "get_next_recent_changes_batch", async {
+            let mut conn = db.get_connection("wikidata").await?;
+            let results: Vec<RecentChanges> = conn
+                .exec_iter(sql, (oldest, &upper_limit, max_rc))
+                .await?
+                .map_and_drop(RecentChanges::from_row)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
+            Ok(results)
+        })
+        .await
     }
 
     pub(crate) fn sanitize_timestamp(ts: &str) -> Result<&str> {
@@ -129,15 +176,19 @@ impl WdRc {
         let delete_from_deleted = delete_from_deleted.join(",");
 
         // Write changes to DB
-        let mut conn = self.db.get_connection("wdrc").await?;
+        let timeout = self.db_timeout;
+        let db = &self.db;
+        Self::with_timeout(timeout, "log_new_items", async {
+            let mut conn = db.get_connection("wdrc").await?;
 
-        let sql = format!("REPLACE INTO `creations` (`q`,`timestamp`) VALUES {updates}");
-        conn.exec_drop(&sql, ()).await?;
+            let sql = format!("REPLACE INTO `creations` (`q`,`timestamp`) VALUES {updates}");
+            conn.exec_drop(&sql, ()).await?;
 
-        let sql = format!("DELETE FROM `deletions` WHERE `q` IN  ({delete_from_deleted})");
-        conn.exec_drop(&sql, ()).await?;
-
-        Ok(())
+            let sql = format!("DELETE FROM `deletions` WHERE `q` IN  ({delete_from_deleted})");
+            conn.exec_drop(&sql, ()).await?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn log_recent_changes(&mut self, rc: &RecentChangesResults) -> Result<()> {
@@ -172,7 +223,12 @@ impl WdRc {
     }
 
     pub async fn update_recent_redirects(&self) -> Result<()> {
-        let (updates, new_ts) = self.update_recent_redirects_get_updates().await?;
+        let (updates, new_ts) = Self::with_timeout(
+            self.db_timeout,
+            "update_recent_redirects_get_updates",
+            self.update_recent_redirects_get_updates(),
+        )
+        .await?;
         if updates.is_empty() {
             return Ok(());
         }
@@ -181,11 +237,13 @@ impl WdRc {
         let updates = updates.join(",");
         let sql =
             format!("REPLACE INTO `redirects` (`source`,`target`,`timestamp`) VALUES {updates}");
-        self.db
-            .get_connection("wdrc")
-            .await?
-            .exec_drop(&sql, ())
-            .await?;
+        let timeout = self.db_timeout;
+        let db = &self.db;
+        Self::with_timeout(timeout, "update_recent_redirects write", async {
+            db.get_connection("wdrc").await?.exec_drop(&sql, ()).await?;
+            Ok(())
+        })
+        .await?;
         self.set_key_value("timestamp_redirect", &new_ts).await?;
         Ok(())
     }
@@ -237,7 +295,12 @@ impl WdRc {
     }
 
     pub async fn update_recent_deletions(&self) -> Result<()> {
-        let (updates, new_ts) = self.update_recent_deletions_get_updates().await?;
+        let (updates, new_ts) = Self::with_timeout(
+            self.db_timeout,
+            "update_recent_deletions_get_updates",
+            self.update_recent_deletions_get_updates(),
+        )
+        .await?;
         if updates.is_empty() {
             return Ok(());
         }
@@ -245,11 +308,13 @@ impl WdRc {
 
         let updates = updates.join(",");
         let sql = format!("REPLACE INTO `deletions` (`q`,`timestamp`) VALUES {updates}");
-        self.db
-            .get_connection("wdrc")
-            .await?
-            .exec_drop(&sql, ())
-            .await?;
+        let timeout = self.db_timeout;
+        let db = &self.db;
+        Self::with_timeout(timeout, "update_recent_deletions write", async {
+            db.get_connection("wdrc").await?.exec_drop(&sql, ()).await?;
+            Ok(())
+        })
+        .await?;
         self.set_key_value("timestamp_deletion", &new_ts).await?;
         Ok(())
     }
@@ -303,11 +368,13 @@ impl WdRc {
             .collect::<Vec<String>>();
         if !values.is_empty() {
             let sql = format!("INSERT IGNORE INTO `statements` (`item`,`revision`,`property`,`timestamp`,`change_type`) VALUES {}",values.join(",")) ;
-            self.db
-                .get_connection("wdrc")
-                .await?
-                .exec_drop(&sql, ())
-                .await?;
+            let timeout = self.db_timeout;
+            let db = &self.db;
+            Self::with_timeout(timeout, "log_statement_changes", async {
+                db.get_connection("wdrc").await?.exec_drop(&sql, ()).await?;
+                Ok(())
+            })
+            .await?;
         }
         Ok(())
     }
@@ -334,11 +401,13 @@ impl WdRc {
 				"INSERT IGNORE INTO `labels` (`item`,`revision`,`type`,`timestamp`,`change_type`,`language`) VALUES {}",
 				parts.join(",")
 			);
-            self.db
-                .get_connection("wdrc")
-                .await?
-                .exec_drop(&sql, ())
-                .await?;
+            let timeout = self.db_timeout;
+            let db = &self.db;
+            Self::with_timeout(timeout, "log_sitelinks_changes", async {
+                db.get_connection("wdrc").await?.exec_drop(&sql, ()).await?;
+                Ok(())
+            })
+            .await?;
         }
         Ok(())
     }
@@ -369,11 +438,13 @@ impl WdRc {
 				"INSERT IGNORE INTO `labels` (`item`,`revision`,`type`,`timestamp`,`change_type`,`language`) VALUES {}",
 				parts.join(",")
 			);
-            self.db
-                .get_connection("wdrc")
-                .await?
-                .exec_drop(&sql, ())
-                .await?;
+            let timeout = self.db_timeout;
+            let db = &self.db;
+            Self::with_timeout(timeout, "log_label_changes", async {
+                db.get_connection("wdrc").await?.exec_drop(&sql, ()).await?;
+                Ok(())
+            })
+            .await?;
         }
         Ok(())
     }
@@ -391,13 +462,19 @@ impl WdRc {
             Some(id) => Ok(*id),
             None => {
                 let sql = "INSERT INTO `texts` (`value`) VALUES (?)";
-                let mut conn = self.db.get_connection("wdrc").await?;
-                conn.exec_drop(sql, (text,))
-                    .await
-                    .map_err(|e| anyhow!("Error inserting text: {}", e))?;
-                let id = conn
-                    .last_insert_id()
-                    .ok_or_else(|| anyhow!("No text row inserted"))?;
+                let timeout = self.db_timeout;
+                let db = &self.db;
+                let id = Self::with_timeout(timeout, "get_or_create_text_id", async {
+                    let mut conn = db.get_connection("wdrc").await?;
+                    conn.exec_drop(sql, (text,))
+                        .await
+                        .map_err(|e| anyhow!("Error inserting text: {}", e))?;
+                    let id = conn
+                        .last_insert_id()
+                        .ok_or_else(|| anyhow!("No text row inserted"))?;
+                    Ok(id)
+                })
+                .await?;
                 self.text_cache.insert(text.to_string(), id);
                 Ok(id)
             }
@@ -407,11 +484,18 @@ impl WdRc {
     async fn cache_texts_in_memory(&mut self) -> Result<()> {
         if self.text_cache.is_empty() {
             let sql = "SELECT `value`,`id` FROM `texts`";
-            let mut conn = self.db.get_connection("wdrc").await?;
-            let result: Vec<(String, TextId)> = conn
-                .exec_iter(sql, ())
-                .await?
-                .map_and_drop(from_row::<(String, TextId)>)
+            let timeout = self.db_timeout;
+            let db = &self.db;
+            let result: Vec<(String, TextId)> =
+                Self::with_timeout(timeout, "cache_texts_in_memory", async {
+                    let mut conn = db.get_connection("wdrc").await?;
+                    let result: Vec<(String, TextId)> = conn
+                        .exec_iter(sql, ())
+                        .await?
+                        .map_and_drop(from_row::<(String, TextId)>)
+                        .await?;
+                    Ok(result)
+                })
                 .await?;
             self.text_cache = result.into_iter().collect();
         }
@@ -420,20 +504,30 @@ impl WdRc {
 
     async fn get_key_value(&self, key: &str) -> Result<Option<String>> {
         let sql = "SELECT value FROM `meta` WHERE `key`=?";
-        let mut conn = self.db.get_connection("wdrc").await?;
-        let result: Vec<String> = conn
-            .exec_iter(sql, (key,))
-            .await?
-            .map_and_drop(from_row::<String>)
-            .await?;
-        Ok(result.first().map(|s| s.to_string()))
+        let timeout = self.db_timeout;
+        let db = &self.db;
+        Self::with_timeout(timeout, &format!("get_key_value({key})"), async {
+            let mut conn = db.get_connection("wdrc").await?;
+            let result: Vec<String> = conn
+                .exec_iter(sql, (key,))
+                .await?
+                .map_and_drop(from_row::<String>)
+                .await?;
+            Ok(result.first().map(|s| s.to_string()))
+        })
+        .await
     }
 
     async fn set_key_value(&self, key: &str, value: &str) -> Result<()> {
         let sql = "UPDATE `meta` SET `value`=? WHERE `key`=?";
-        let mut conn = self.db.get_connection("wdrc").await?;
-        conn.exec_drop(sql, (value, key)).await?;
-        Ok(())
+        let timeout = self.db_timeout;
+        let db = &self.db;
+        Self::with_timeout(timeout, &format!("set_key_value({key})"), async {
+            let mut conn = db.get_connection("wdrc").await?;
+            conn.exec_drop(sql, (value, key)).await?;
+            Ok(())
+        })
+        .await
     }
 
     fn read_config(config_file: &str) -> Value {
@@ -462,6 +556,11 @@ impl WdRc {
     }
 
     pub async fn run_once(&mut self) -> Result<()> {
+        let run_timeout = self.run_timeout;
+        Self::with_timeout(run_timeout, "run_once", self.run_once_inner()).await
+    }
+
+    async fn run_once_inner(&mut self) -> Result<()> {
         let future1 = self.update_recent_deletions();
         let future2 = self.update_recent_redirects();
         let _ = join!(future1, future2); // Ignore errors
