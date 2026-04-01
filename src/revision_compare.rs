@@ -277,6 +277,23 @@ impl RevisionCompare {
         None
     }
 
+    /// Build a HashMap from claim ID to (property, claim Value) for O(1) lookups.
+    fn build_claim_index<'a>(
+        claims: &'a Map<String, Value>,
+    ) -> HashMap<&'a str, (&'a str, &'a Value)> {
+        let mut index = HashMap::new();
+        for (property, prop_claims) in claims.iter() {
+            if let Some(arr) = prop_claims.as_array() {
+                for claim in arr {
+                    if let Some(id) = claim.get("id").and_then(|v| v.as_str()) {
+                        index.insert(id, (property.as_str(), claim));
+                    }
+                }
+            }
+        }
+        index
+    }
+
     fn create_claim_change(&self, change_type: ChangeType, property: &str, id: &str) -> Change {
         Change {
             item_id: self.item_id,
@@ -295,37 +312,28 @@ impl RevisionCompare {
         let old_claims = Self::json_object(rev_old, "claims");
         let new_claims = Self::json_object(rev_new, "claims");
 
-        let mut all_properties: Vec<String> = old_claims.keys().map(|s| s.to_owned()).collect();
-        all_properties.append(&mut new_claims.keys().map(|s| s.to_owned()).collect());
-        all_properties.sort();
-        all_properties.dedup();
+        // Build O(1) lookup indexes instead of scanning all claims per lookup
+        let old_index = Self::build_claim_index(&old_claims);
+        let new_index = Self::build_claim_index(&new_claims);
 
-        for (property, prop_claims) in old_claims.iter() {
-            for claim in prop_claims.as_array().unwrap_or(&vec![]) {
-                let claim_id = match claim.get("id").and_then(|v| v.as_str()) {
-                    Some(id) => id,
-                    None => continue,
-                };
-                let new_claim = Self::get_claim_by_id(claim_id, &new_claims);
-                if new_claim.is_none() {
+        // Find removed and changed claims
+        for (claim_id, (property, old_claim)) in &old_index {
+            match new_index.get(claim_id) {
+                None => {
                     ret.push(self.create_claim_change(ChangeType::Removed, property, claim_id));
-                } else if let Some(new_claim) = new_claim {
-                    if claim != &new_claim {
+                }
+                Some((_new_prop, new_claim)) => {
+                    if old_claim != new_claim {
                         ret.push(self.create_claim_change(ChangeType::Changed, property, claim_id));
                     }
                 }
             }
         }
-        for (property, prop_claims) in new_claims.iter() {
-            for claim in prop_claims.as_array().unwrap_or(&vec![]) {
-                let claim_id = match claim.get("id").and_then(|v| v.as_str()) {
-                    Some(id) => id,
-                    None => continue,
-                };
-                let old_claim = Self::get_claim_by_id(claim_id, &old_claims);
-                if old_claim.is_none() {
-                    ret.push(self.create_claim_change(ChangeType::Added, property, claim_id));
-                }
+
+        // Find added claims
+        for (claim_id, (property, _new_claim)) in &new_index {
+            if !old_index.contains_key(claim_id) {
+                ret.push(self.create_claim_change(ChangeType::Added, property, claim_id));
             }
         }
 
@@ -614,7 +622,8 @@ mod tests {
         }});
         let wd = Arc::new(Wikidata::new());
         let rc = RevisionCompare::new(wd);
-        let changes = rc.compare_statements(&old, &new);
+        let mut changes = rc.compare_statements(&old, &new);
+        changes.sort_by(|a, b| a.id.cmp(&b.id));
         let expected = vec![
             Change {
                 subject: ChangeSubject::Claims,
@@ -657,6 +666,8 @@ mod tests {
             // json!({"subject": "claims","change": "added","property": "P1","id": "Q1$127"}),
             // json!({"subject": "claims","change": "added","property": "P3","id": "Q1$128"}),
         ];
+        let mut expected = expected;
+        expected.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(changes, expected);
     }
 
