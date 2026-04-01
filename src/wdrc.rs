@@ -92,8 +92,10 @@ impl WdRc {
     }
 
     pub fn make_id_numeric(id: &str) -> Result<ItemId> {
-        let q = &id[1..];
-        let q = q.parse::<ItemId>()?;
+        if id.len() < 2 {
+            return Err(anyhow!("Bad ID: {id:?}"));
+        }
+        let q = id[1..].parse::<ItemId>()?;
         if q == 0 {
             return Err(anyhow!("Bad ID: {id:?}"));
         }
@@ -462,5 +464,23 @@ mod tests {
         let text = "aawikibooks";
         let id = wdrc.get_or_create_text_id(text).await.unwrap();
         assert_eq!(id, 1252);
+    }
+
+    #[test]
+    fn test_make_id_numeric() {
+        // Empty string should return Err, not panic
+        assert!(WdRc::make_id_numeric("").is_err());
+
+        // Single char "Q" -> no numeric part, should return Err
+        assert!(WdRc::make_id_numeric("Q").is_err());
+
+        // "Q0" -> zero is explicitly rejected
+        assert!(WdRc::make_id_numeric("Q0").is_err());
+
+        // Valid Q-prefixed ID
+        assert_eq!(WdRc::make_id_numeric("Q42").unwrap(), 42);
+
+        // Valid P-prefixed ID
+        assert_eq!(WdRc::make_id_numeric("P123").unwrap(), 123);
     }
 }
