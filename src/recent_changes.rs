@@ -110,15 +110,21 @@ impl ChangedItem {
 pub struct RecentChangesResults {
     new_items: Vec<NewItem>,
     changed_items: Vec<ChangedItem>,
+    last_timestamp: Option<String>,
 }
 
 impl RecentChangesResults {
     pub fn new(results: &[RecentChanges]) -> Self {
         let mut new_items: HashMap<String, NewItem> = HashMap::new();
         let mut changed_items: HashMap<String, ChangedItem> = HashMap::new();
+        let mut last_timestamp: Option<String> = None;
         for result in results {
             let q = result.rc_title.clone();
             let timestamp = result.rc_timestamp.clone();
+            match &last_timestamp {
+                Some(ts) if ts >= &timestamp => {}
+                _ => last_timestamp = Some(timestamp.clone()),
+            }
             if result.rc_new {
                 new_items.insert(q.clone(), NewItem { q, timestamp });
             } else {
@@ -150,12 +156,13 @@ impl RecentChangesResults {
         Self {
             new_items: new_items.into_values().collect(),
             changed_items: changed_items.into_values().collect(),
+            last_timestamp,
         }
     }
 
-    /// Returns the last timestamp of the changed items, or the given oldest timestamp as fallback.
+    /// Returns the last timestamp across all results (new + changed), or the given oldest timestamp as fallback.
     pub fn get_last_rc_timetamp(&self, oldest: &str) -> String {
-        match self.changed_items.iter().map(|r| &r.timestamp).max() {
+        match &self.last_timestamp {
             Some(t) => t.to_owned(),
             None => oldest.to_string(),
         }
@@ -300,9 +307,22 @@ mod tests {
     fn test_get_last_rc_timetamp_only_new_items() {
         let results = vec![make_rc("Q99", true, 0, 50)];
         let rcr = RecentChangesResults::new(&results);
-        // Only new items, no changed items, should return fallback
+        // Now tracks all results, including new items
         let ts = rcr.get_last_rc_timetamp("19990101000000");
-        assert_eq!(ts, "19990101000000");
+        assert_eq!(ts, "20240101000000");
+    }
+
+    #[test]
+    fn test_get_last_rc_timetamp_picks_max_across_new_and_changed() {
+        let mut rc_new = make_rc("Q99", true, 0, 50);
+        rc_new.rc_timestamp = "20240701000000".to_string();
+        let mut rc_changed = make_rc("Q1", false, 100, 101);
+        rc_changed.rc_timestamp = "20240601000000".to_string();
+        let results = vec![rc_changed, rc_new];
+        let rcr = RecentChangesResults::new(&results);
+        // The new item has the later timestamp
+        let ts = rcr.get_last_rc_timetamp("19990101000000");
+        assert_eq!(ts, "20240701000000");
     }
 
     #[test]
