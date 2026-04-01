@@ -119,7 +119,7 @@ impl WdRc {
             .map(|dt| dt + Duration::from_secs(60 * 60))
             .map(|dt| TimeStamp::datetime(&dt))
             .unwrap_or("99991231235900".to_string());
-        let sql = "SELECT * FROM `recentchanges` WHERE `rc_namespace`=0 AND `rc_timestamp`>=? AND rc_timestamp<=? ORDER BY `rc_timestamp`,`rc_title`,`rc_id` LIMIT ?";
+        let sql = "SELECT `rc_source`,`rc_timestamp`,`rc_title`,`rc_this_oldid`,`rc_last_oldid` FROM `recentchanges` WHERE `rc_namespace`=0 AND `rc_timestamp`>=? AND rc_timestamp<=? ORDER BY `rc_timestamp`,`rc_title`,`rc_id` LIMIT ?";
         let timeout = self.db_timeout;
         let db = &self.db;
         let max_rc = &self.max_recent_changes;
@@ -279,7 +279,7 @@ impl WdRc {
 
     async fn get_recent_redirects(&self, oldest: &str) -> Result<Vec<RecentRedirects>> {
         let sql = "SELECT `rc_title` AS `source`,`rd_title` AS `target`,max(`rc_timestamp`) AS `timestamp` FROM `recentchanges`,`redirect`
-			WHERE `rc_namespace`=0 AND `rd_from`=`rc_cur_id` AND `rd_namespace`=0 AND `rc_timestamp`>=? GROUP BY `source`,`target`";
+			WHERE `rc_namespace`=0 AND `rd_from`=`rc_cur_id` AND `rd_namespace`=0 AND `rc_timestamp`>=? GROUP BY `source`,`target` ORDER BY `timestamp` LIMIT 5000";
         let results: Vec<RecentRedirects> = self
             .db
             .get_connection("wikidata")
@@ -345,7 +345,7 @@ impl WdRc {
     }
 
     async fn get_recent_deletions(&self, oldest: &str) -> Result<Vec<RecentDeletions>> {
-        let sql = "SELECT `log_title` AS `q`,`log_timestamp` AS `timestamp` FROM `logging` WHERE `log_type`='delete' AND `log_action`='delete' AND `log_timestamp`>=? AND `log_namespace`=0";
+        let sql = "SELECT `log_title` AS `q`,`log_timestamp` AS `timestamp` FROM `logging` WHERE `log_type`='delete' AND `log_action`='delete' AND `log_timestamp`>=? AND `log_namespace`=0 ORDER BY `log_timestamp` LIMIT 5000";
         let results: Vec<RecentDeletions> = self
             .db
             .get_connection("wikidata")
