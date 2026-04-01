@@ -692,4 +692,111 @@ mod tests {
         let result = RevisionCompare::get_claim_by_id("12345", &claims_bad_id);
         assert!(result.is_none());
     }
+
+    #[test]
+    fn test_extract_revisions_empty_response() {
+        let j = json!({});
+        let result = RevisionCompare::extract_revisions(100, 200, &j);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_revisions_valid() {
+        let j = json!({
+            "query": {
+                "pages": {
+                    "123": {
+                        "revisions": [
+                            {
+                                "revid": 100,
+                                "slots": {
+                                    "main": {
+                                        "*": "{\"id\":\"Q42\",\"type\":\"item\"}"
+                                    }
+                                }
+                            },
+                            {
+                                "revid": 200,
+                                "slots": {
+                                    "main": {
+                                        "*": "{\"id\":\"Q42\",\"type\":\"item\",\"labels\":{\"en\":{\"value\":\"test\"}}}"
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let result = RevisionCompare::extract_revisions(100, 200, &j);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get(&100).unwrap()["id"].as_str().unwrap(), "Q42");
+        assert_eq!(result.get(&200).unwrap()["id"].as_str().unwrap(), "Q42");
+    }
+
+    #[test]
+    fn test_extract_revisions_ignores_unmatched_revids() {
+        let j = json!({
+            "query": {
+                "pages": {
+                    "123": {
+                        "revisions": [
+                            {
+                                "revid": 999,
+                                "slots": {
+                                    "main": {
+                                        "*": "{\"id\":\"Q42\"}"
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let result = RevisionCompare::extract_revisions(100, 200, &j);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_revisions_invalid_json_in_slot() {
+        let j = json!({
+            "query": {
+                "pages": {
+                    "123": {
+                        "revisions": [
+                            {
+                                "revid": 100,
+                                "slots": {
+                                    "main": {
+                                        "*": "not valid json {"
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let result = RevisionCompare::extract_revisions(100, 200, &j);
+        assert!(result.is_empty()); // Invalid JSON should be skipped
+    }
+
+    #[test]
+    fn test_get_revisions_url() {
+        let url = RevisionCompare::get_revisions_url("Q42", 100, 200);
+        assert!(url.contains("Q42"));
+        assert!(url.contains("200")); // rvstartid
+        assert!(url.contains("100")); // rvendid
+    }
+
+    #[test]
+    fn test_compare_revisions_empty() {
+        let wd = Arc::new(Wikidata::new());
+        let rc = RevisionCompare::new(wd);
+        let old = json!({});
+        let new = json!({});
+        let changes = rc.compare_revisions(&old, &new);
+        assert!(changes.is_empty());
+    }
 }

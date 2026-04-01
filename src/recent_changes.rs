@@ -276,4 +276,57 @@ mod tests {
         assert_eq!(rcr.new_items()[0].q(), "Q99");
         assert!(rcr.changed_items().is_empty());
     }
+
+    #[test]
+    fn test_get_last_rc_timetamp_with_items() {
+        let results = vec![
+            make_rc("Q1", false, 100, 101),
+            make_rc("Q2", false, 200, 201),
+        ];
+        let rcr = RecentChangesResults::new(&results);
+        // Should return max timestamp (they're all the same "20240101000000" from make_rc)
+        let ts = rcr.get_last_rc_timetamp("19990101000000");
+        assert_eq!(ts, "20240101000000");
+    }
+
+    #[test]
+    fn test_get_last_rc_timetamp_empty() {
+        let rcr = RecentChangesResults::new(&[]);
+        let ts = rcr.get_last_rc_timetamp("19990101000000");
+        assert_eq!(ts, "19990101000000"); // Falls back to oldest
+    }
+
+    #[test]
+    fn test_get_last_rc_timetamp_only_new_items() {
+        let results = vec![make_rc("Q99", true, 0, 50)];
+        let rcr = RecentChangesResults::new(&results);
+        // Only new items, no changed items, should return fallback
+        let ts = rcr.get_last_rc_timetamp("19990101000000");
+        assert_eq!(ts, "19990101000000");
+    }
+
+    #[test]
+    fn test_multiple_items_different_timestamps() {
+        let mut rc1 = make_rc("Q1", false, 100, 101);
+        rc1.rc_timestamp = "20240101000000".to_string();
+        let mut rc2 = make_rc("Q2", false, 200, 201);
+        rc2.rc_timestamp = "20240601000000".to_string();
+        let results = vec![rc1, rc2];
+        let rcr = RecentChangesResults::new(&results);
+        let ts = rcr.get_last_rc_timetamp("19990101000000");
+        assert_eq!(ts, "20240601000000");
+    }
+
+    #[test]
+    fn test_duplicate_new_items_last_wins() {
+        let mut rc1 = make_rc("Q99", true, 0, 50);
+        rc1.rc_timestamp = "20240101000000".to_string();
+        let mut rc2 = make_rc("Q99", true, 0, 51);
+        rc2.rc_timestamp = "20240601000000".to_string();
+        let results = vec![rc1, rc2];
+        let rcr = RecentChangesResults::new(&results);
+        assert_eq!(rcr.new_items().len(), 1);
+        // The HashMap insert means last one wins
+        assert_eq!(rcr.new_items()[0].q(), "Q99");
+    }
 }
