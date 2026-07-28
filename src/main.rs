@@ -37,6 +37,9 @@ async fn main() {
 }
 
 /* TESTING
+On Toolforge, credentials are read from ~/replica.my.cnf by the `toolforge` crate.
+For local testing, open SSH tunnels and add an explicit `url` to the respective
+config section, which overrides the ~/replica.my.cnf lookup:
 ssh magnus@login.toolforge.org -L 3308:tools-db:3306 -N &
-ssh magnus@login.toolforge.org -L 3309:wikidatawiki.web.db.svc.eqiad.wmflabs:3306 -N &
+ssh magnus@login.toolforge.org -L 3309:wikidatawiki.analytics.db.svc.wikimedia.cloud:3306 -N &
 */

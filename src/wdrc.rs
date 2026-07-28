@@ -7,10 +7,13 @@ use anyhow::{anyhow, Result};
 use futures::{join, StreamExt};
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs::File, io::BufReader, sync::Arc, time::Duration};
+use toolforge::{
+    connection_info,
+    db::{toolsdb, DBConnectionInfo},
+};
 use wikimisc::{
-    mysql_async::{from_row, prelude::Queryable},
+    mysql_async::{from_row, prelude::Queryable, Pool},
     timestamp::TimeStamp,
-    toolforge_db::ToolforgeDB,
     wikidata::Wikidata,
 };
 
@@ -26,6 +29,11 @@ pub enum RunResult {
     CaughtUp,
 }
 
+/// The Wikidata replica database, without the `_p` suffix.
+const WIKIDATA_DB: &str = "wikidatawiki";
+/// The tool's own database on toolsdb.
+const WDRC_DB: &str = "s55078__wdrc_p";
+
 const MAX_RECENT_CHANGES: u64 = 500;
 const MAX_API_CONCURRENT: u64 = 50;
 /// Default timeout for individual DB queries (seconds)
@@ -39,7 +47,8 @@ const DEFAULT_BOT_SLEEP_SEC: u64 = 10;
 pub struct WdRc {
     text_cache: HashMap<String, TextId>,
     wd: Arc<Wikidata>,
-    db: ToolforgeDB,
+    wikidata_pool: Pool,
+    wdrc_pool: Pool,
     logging: bool,
     max_recent_changes: u64,
     max_api_concurrent: usize,
@@ -63,10 +72,12 @@ impl WdRc {
             .get("bot_sleep_sec")
             .and_then(|j| j.as_u64())
             .unwrap_or(DEFAULT_BOT_SLEEP_SEC);
+        let (wikidata_pool, wdrc_pool) = Self::prepare_pools(&config);
         WdRc {
             text_cache: HashMap::new(),
             wd: Self::prepare_wd(),
-            db: Self::prepare_db(&config),
+            wikidata_pool,
+            wdrc_pool,
             logging: config
                 .get("logging")
                 .unwrap_or(&json!(false))
@@ -130,10 +141,10 @@ impl WdRc {
             .unwrap_or("99991231235900".to_string());
         let sql = "SELECT `rc_source`,`rc_timestamp`,`rc_title`,`rc_this_oldid`,`rc_last_oldid` FROM `recentchanges` WHERE `rc_namespace`=0 AND `rc_timestamp`>=? AND rc_timestamp<=? ORDER BY `rc_timestamp`,`rc_title`,`rc_id` LIMIT ?";
         let timeout = self.db_timeout;
-        let db = &self.db;
+        let pool = &self.wikidata_pool;
         let max_rc = &self.max_recent_changes;
         Self::with_timeout(timeout, "get_next_recent_changes_batch", async {
-            let mut conn = db.get_connection("wikidata").await?;
+            let mut conn = pool.get_conn().await?;
             let results: Vec<RecentChanges> = conn
                 .exec_iter(sql, (oldest, &upper_limit, max_rc))
                 .await?
@@ -186,22 +197,16 @@ impl WdRc {
 
         // Write changes to DB in parallel (different tables, no ordering dependency)
         let timeout = self.db_timeout;
-        let db = &self.db;
+        let pool = &self.wdrc_pool;
         let create_sql = format!("REPLACE INTO `creations` (`q`,`timestamp`) VALUES {updates}");
         let delete_sql = format!("DELETE FROM `deletions` WHERE `q` IN ({delete_from_deleted})");
 
         let create_fut = Self::with_timeout(timeout, "log_new_items/creations", async {
-            db.get_connection("wdrc")
-                .await?
-                .exec_drop(&create_sql, ())
-                .await?;
+            pool.get_conn().await?.exec_drop(&create_sql, ()).await?;
             Ok(())
         });
         let delete_fut = Self::with_timeout(timeout, "log_new_items/deletions", async {
-            db.get_connection("wdrc")
-                .await?
-                .exec_drop(&delete_sql, ())
-                .await?;
+            pool.get_conn().await?.exec_drop(&delete_sql, ()).await?;
             Ok(())
         });
         let (r1, r2) = join!(create_fut, delete_fut);
@@ -251,9 +256,9 @@ impl WdRc {
         let sql =
             format!("REPLACE INTO `redirects` (`source`,`target`,`timestamp`) VALUES {updates}");
         let timeout = self.db_timeout;
-        let db = &self.db;
+        let pool = &self.wdrc_pool;
         Self::with_timeout(timeout, "update_recent_redirects write", async {
-            db.get_connection("wdrc").await?.exec_drop(&sql, ()).await?;
+            pool.get_conn().await?.exec_drop(&sql, ()).await?;
             Ok(())
         })
         .await?;
@@ -294,8 +299,8 @@ impl WdRc {
         let sql = "SELECT `rc_title` AS `source`,`rd_title` AS `target`,max(`rc_timestamp`) AS `timestamp` FROM `recentchanges`,`redirect`
 			WHERE `rc_namespace`=0 AND `rd_from`=`rc_cur_id` AND `rd_namespace`=0 AND `rc_timestamp`>=? GROUP BY `source`,`target` ORDER BY `timestamp` LIMIT 5000";
         let results: Vec<RecentRedirects> = self
-            .db
-            .get_connection("wikidata")
+            .wikidata_pool
+            .get_conn()
             .await?
             .exec_iter(sql, (oldest,))
             .await?
@@ -322,9 +327,9 @@ impl WdRc {
         let updates = updates.join(",");
         let sql = format!("REPLACE INTO `deletions` (`q`,`timestamp`) VALUES {updates}");
         let timeout = self.db_timeout;
-        let db = &self.db;
+        let pool = &self.wdrc_pool;
         Self::with_timeout(timeout, "update_recent_deletions write", async {
-            db.get_connection("wdrc").await?.exec_drop(&sql, ()).await?;
+            pool.get_conn().await?.exec_drop(&sql, ()).await?;
             Ok(())
         })
         .await?;
@@ -360,8 +365,8 @@ impl WdRc {
     async fn get_recent_deletions(&self, oldest: &str) -> Result<Vec<RecentDeletions>> {
         let sql = "SELECT `log_title` AS `q`,`log_timestamp` AS `timestamp` FROM `logging` WHERE `log_type`='delete' AND `log_action`='delete' AND `log_timestamp`>=? AND `log_namespace`=0 ORDER BY `log_timestamp` LIMIT 5000";
         let results: Vec<RecentDeletions> = self
-            .db
-            .get_connection("wikidata")
+            .wikidata_pool
+            .get_conn()
             .await?
             .exec_iter(sql, (oldest,))
             .await?
@@ -445,15 +450,12 @@ impl WdRc {
 
         // Phase 3: Execute all DB writes in parallel
         let timeout = self.db_timeout;
-        let db = &self.db;
+        let pool = &self.wdrc_pool;
 
         let stmt_fut = async {
             if let Some(sql) = &stmt_sql {
                 Self::with_timeout(timeout, "log_statement_changes", async {
-                    db.get_connection("wdrc")
-                        .await?
-                        .exec_drop(sql.as_str(), ())
-                        .await?;
+                    pool.get_conn().await?.exec_drop(sql.as_str(), ()).await?;
                     Ok(())
                 })
                 .await
@@ -464,10 +466,7 @@ impl WdRc {
         let sitelinks_fut = async {
             if let Some(sql) = &sitelinks_sql {
                 Self::with_timeout(timeout, "log_sitelinks_changes", async {
-                    db.get_connection("wdrc")
-                        .await?
-                        .exec_drop(sql.as_str(), ())
-                        .await?;
+                    pool.get_conn().await?.exec_drop(sql.as_str(), ()).await?;
                     Ok(())
                 })
                 .await
@@ -478,10 +477,7 @@ impl WdRc {
         let labels_fut = async {
             if let Some(sql) = &labels_sql {
                 Self::with_timeout(timeout, "log_label_changes", async {
-                    db.get_connection("wdrc")
-                        .await?
-                        .exec_drop(sql.as_str(), ())
-                        .await?;
+                    pool.get_conn().await?.exec_drop(sql.as_str(), ()).await?;
                     Ok(())
                 })
                 .await
@@ -504,9 +500,9 @@ impl WdRc {
             None => {
                 let sql = "INSERT INTO `texts` (`value`) VALUES (?)";
                 let timeout = self.db_timeout;
-                let db = &self.db;
+                let pool = &self.wdrc_pool;
                 let id = Self::with_timeout(timeout, "get_or_create_text_id", async {
-                    let mut conn = db.get_connection("wdrc").await?;
+                    let mut conn = pool.get_conn().await?;
                     conn.exec_drop(sql, (text,))
                         .await
                         .map_err(|e| anyhow!("Error inserting text: {}", e))?;
@@ -526,10 +522,10 @@ impl WdRc {
         if self.text_cache.is_empty() {
             let sql = "SELECT `value`,`id` FROM `texts`";
             let timeout = self.db_timeout;
-            let db = &self.db;
+            let pool = &self.wdrc_pool;
             let result: Vec<(String, TextId)> =
                 Self::with_timeout(timeout, "cache_texts_in_memory", async {
-                    let mut conn = db.get_connection("wdrc").await?;
+                    let mut conn = pool.get_conn().await?;
                     let result: Vec<(String, TextId)> = conn
                         .exec_iter(sql, ())
                         .await?
@@ -546,9 +542,9 @@ impl WdRc {
     async fn get_key_value(&self, key: &str) -> Result<Option<String>> {
         let sql = "SELECT value FROM `meta` WHERE `key`=?";
         let timeout = self.db_timeout;
-        let db = &self.db;
+        let pool = &self.wdrc_pool;
         Self::with_timeout(timeout, &format!("get_key_value({key})"), async {
-            let mut conn = db.get_connection("wdrc").await?;
+            let mut conn = pool.get_conn().await?;
             let result: Vec<String> = conn
                 .exec_iter(sql, (key,))
                 .await?
@@ -562,9 +558,9 @@ impl WdRc {
     async fn set_key_value(&self, key: &str, value: &str) -> Result<()> {
         let sql = "UPDATE `meta` SET `value`=? WHERE `key`=?";
         let timeout = self.db_timeout;
-        let db = &self.db;
+        let pool = &self.wdrc_pool;
         Self::with_timeout(timeout, &format!("set_key_value({key})"), async {
-            let mut conn = db.get_connection("wdrc").await?;
+            let mut conn = pool.get_conn().await?;
             conn.exec_drop(sql, (value, key)).await?;
             Ok(())
         })
@@ -585,15 +581,51 @@ impl WdRc {
         Arc::new(wd)
     }
 
-    fn prepare_db(config: &Value) -> ToolforgeDB {
-        let mut db = ToolforgeDB::default();
+    /// Creates the connection pools for the Wikidata replica and the tool's own database.
+    fn prepare_pools(config: &Value) -> (Pool, Pool) {
         let config_wikidata = config.get("wikidata").expect("Missing wikidata config");
         let config_wdrc = config.get("wdrc").expect("Missing wdrc config");
-        db.add_mysql_pool("wikidata", config_wikidata)
-            .expect("Adding wikidata pool failed");
-        db.add_mysql_pool("wdrc", config_wdrc)
-            .expect("Adding wdrc pool failed");
-        db
+        // The analytics cluster is the right place for the long-running recentchanges
+        // and logging queries this bot issues.
+        let wikidata_pool = Self::prepare_pool("wikidata", config_wikidata, || {
+            connection_info!(Self::db_name(config_wikidata, WIKIDATA_DB), ANALYTICS)
+        });
+        let wdrc_pool = Self::prepare_pool("wdrc", config_wdrc, || {
+            toolsdb(Self::db_name(config_wdrc, WDRC_DB).to_string())
+        });
+        (wikidata_pool, wdrc_pool)
+    }
+
+    fn db_name<'a>(config: &'a Value, default: &'a str) -> &'a str {
+        config
+            .get("database")
+            .and_then(|v| v.as_str())
+            .unwrap_or(default)
+    }
+
+    /// Creates a single connection pool.
+    /// An explicit `url` in the config takes precedence, which is useful for local
+    /// development through SSH tunnels. Otherwise the connection info is derived from
+    /// `~/replica.my.cnf` via the `toolforge` crate, so no credentials are needed in
+    /// the config file.
+    fn prepare_pool(
+        name: &str,
+        config: &Value,
+        connection_info: impl FnOnce() -> toolforge::Result<DBConnectionInfo>,
+    ) -> Pool {
+        let url = match config.get("url").and_then(|v| v.as_str()) {
+            Some(url) => url.to_string(),
+            None => {
+                let info =
+                    connection_info().unwrap_or_else(|e| panic!("No {name} connection info: {e}"));
+                match config.get("max_connections").and_then(|v| v.as_u64()) {
+                    Some(max_connections) => info.pool_max(max_connections as usize),
+                    None => info,
+                }
+                .to_string()
+            }
+        };
+        Pool::from_url(&url).unwrap_or_else(|e| panic!("Creating {name} pool failed: {e}"))
     }
 
     pub async fn run_once(&mut self) -> Result<RunResult> {
@@ -637,6 +669,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "requires a local config.json and live access to the wdrc database"]
     async fn test_get_or_create_text_id() {
         let mut wdrc = WdRc::new("config.json");
         let text = "aawikibooks";
