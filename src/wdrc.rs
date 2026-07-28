@@ -583,7 +583,7 @@ impl WdRc {
         let config_wikidata = config.get("wikidata").expect("Missing wikidata config");
         let config_wdrc = config.get("wdrc").expect("Missing wdrc config");
         let wikidata_pool = Self::prepare_pool("wikidata", config_wikidata, || {
-            connection_info!(Self::db_name(config_wikidata, WIKIDATA_DB))
+            connection_info!(Self::db_name(config_wikidata, WIKIDATA_DB), WEB)
         });
         let wdrc_pool = Self::prepare_pool("wdrc", config_wdrc, || {
             toolsdb(Self::db_name(config_wdrc, WDRC_DB).to_string())
