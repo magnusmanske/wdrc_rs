@@ -5,17 +5,14 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use futures::{join, StreamExt};
+use mysql_async::{from_row, prelude::Queryable, Pool};
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs::File, io::BufReader, sync::Arc, time::Duration};
 use toolforge::{
     connection_info,
     db::{toolsdb, DBConnectionInfo},
 };
-use wikimisc::{
-    mysql_async::{from_row, prelude::Queryable, Pool},
-    timestamp::TimeStamp,
-    wikidata::Wikidata,
-};
+use wikimisc::{timestamp::TimeStamp, wikidata::Wikidata};
 
 pub type TextId = u64;
 pub type ItemId = u64;
@@ -585,10 +582,8 @@ impl WdRc {
     fn prepare_pools(config: &Value) -> (Pool, Pool) {
         let config_wikidata = config.get("wikidata").expect("Missing wikidata config");
         let config_wdrc = config.get("wdrc").expect("Missing wdrc config");
-        // The analytics cluster is the right place for the long-running recentchanges
-        // and logging queries this bot issues.
         let wikidata_pool = Self::prepare_pool("wikidata", config_wikidata, || {
-            connection_info!(Self::db_name(config_wikidata, WIKIDATA_DB), ANALYTICS)
+            connection_info!(Self::db_name(config_wikidata, WIKIDATA_DB))
         });
         let wdrc_pool = Self::prepare_pool("wdrc", config_wdrc, || {
             toolsdb(Self::db_name(config_wdrc, WDRC_DB).to_string())

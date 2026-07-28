@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use wikimisc::mysql_async::Row;
+use mysql_async::Row;
 
 use crate::{revision_compare::RevisionId, ItemId, WdRc};
 

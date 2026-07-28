@@ -11,8 +11,12 @@ serde = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 futures = "*"
+mysql_async = "0.36"
 toolforge = { version = "5", features = ["mysql"] }
-wikimisc = { git = "https://github.com/magnusmanske/wikimisc.git" }
+wikimisc = { git = "https://github.com/magnusmanske/wikimisc.git", features = [
+    "date",
+    "wikidata",
+] }
 
 [profile.release]
 opt-level = 3
