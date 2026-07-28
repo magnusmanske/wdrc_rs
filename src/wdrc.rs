@@ -5,13 +5,18 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use futures::{join, StreamExt};
+use ini::Ini;
 use mysql_async::{from_row, prelude::Queryable, Pool};
 use serde_json::{json, Value};
-use std::{collections::HashMap, fs::File, io::BufReader, sync::Arc, time::Duration};
-use toolforge::{
-    connection_info,
-    db::{toolsdb, DBConnectionInfo},
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::BufReader,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
+use toolforge::db::{get_db_connection_info, toolsdb, Cluster, DBConnectionInfo};
 use wikimisc::{timestamp::TimeStamp, wikidata::Wikidata};
 
 pub type TextId = u64;
@@ -30,6 +35,15 @@ pub enum RunResult {
 const WIKIDATA_DB: &str = "wikidatawiki";
 /// The tool's own database on toolsdb.
 const WDRC_DB: &str = "s55078__wdrc_p";
+/// The tool's credentials file. The `toolforge` crate looks for this in `$HOME`,
+/// which is not the tool's home directory in every execution context, so use the
+/// absolute path when it exists.
+const REPLICA_MY_CNF: &str = "/data/project/wdrc/replica.my.cnf";
+/// Connection limit for a Toolforge tool account, and the `toolforge` crate default.
+const DEFAULT_POOL_MAX: usize = 10;
+/// Hosts serving the tool's own database, for regular and local (tunnelled) use.
+const TOOLSDB_HOST: &str = "tools.db.svc.wikimedia.cloud";
+const TOOLSDB_HOST_LOCAL: &str = "tools.db.svc.local.wmftest.net";
 
 const MAX_RECENT_CHANGES: u64 = 500;
 const MAX_API_CONCURRENT: u64 = 50;
@@ -582,13 +596,24 @@ impl WdRc {
     fn prepare_pools(config: &Value) -> (Pool, Pool) {
         let config_wikidata = config.get("wikidata").expect("Missing wikidata config");
         let config_wdrc = config.get("wdrc").expect("Missing wdrc config");
+        let my_cnf = Self::my_cnf_path(config);
         let wikidata_pool = Self::prepare_pool("wikidata", config_wikidata, || {
-            connection_info!(Self::db_name(config_wikidata, WIKIDATA_DB), WEB)
+            Self::wikidata_url(config_wikidata, my_cnf.clone())
         });
         let wdrc_pool = Self::prepare_pool("wdrc", config_wdrc, || {
-            toolsdb(Self::db_name(config_wdrc, WDRC_DB).to_string())
+            Self::wdrc_url(config_wdrc, my_cnf.as_deref())
         });
         (wikidata_pool, wdrc_pool)
+    }
+
+    /// The credentials file to read the database user and password from.
+    /// `None` leaves the `toolforge` crate to look for `$HOME/replica.my.cnf`.
+    fn my_cnf_path(config: &Value) -> Option<PathBuf> {
+        if let Some(path) = config.get("replica_my_cnf").and_then(|v| v.as_str()) {
+            return Some(PathBuf::from(path));
+        }
+        let default = PathBuf::from(REPLICA_MY_CNF);
+        default.exists().then_some(default)
     }
 
     fn db_name<'a>(config: &'a Value, default: &'a str) -> &'a str {
@@ -598,27 +623,76 @@ impl WdRc {
             .unwrap_or(default)
     }
 
+    fn pool_max(config: &Value) -> usize {
+        config
+            .get("max_connections")
+            .and_then(|v| v.as_u64())
+            .map(|max_connections| max_connections as usize)
+            .unwrap_or(DEFAULT_POOL_MAX)
+    }
+
+    /// `toolforge` only names the file it could not find, so say where we looked.
+    fn my_cnf_error(error: impl std::fmt::Display, my_cnf: Option<&Path>) -> anyhow::Error {
+        match my_cnf {
+            Some(my_cnf) => anyhow!("{error} (tried {})", my_cnf.display()),
+            None => anyhow!(
+                "{error} (tried $HOME, as neither the 'replica_my_cnf' config key nor {REPLICA_MY_CNF} was usable)"
+            ),
+        }
+    }
+
+    fn wikidata_url(config: &Value, my_cnf: Option<PathBuf>) -> Result<String> {
+        let db_name = Self::db_name(config, WIKIDATA_DB);
+        let info = get_db_connection_info(db_name, Cluster::WEB, my_cnf.clone())
+            .map_err(|e| Self::my_cnf_error(e, my_cnf.as_deref()))?;
+        Ok(info.pool_max(Self::pool_max(config)).to_string())
+    }
+
+    fn wdrc_url(config: &Value, my_cnf: Option<&Path>) -> Result<String> {
+        let database = Self::db_name(config, WDRC_DB).to_string();
+        match my_cnf {
+            // `toolsdb()` always reads `$HOME/replica.my.cnf` and offers no way to
+            // point it elsewhere, so assemble the URL ourselves in that case.
+            Some(my_cnf) => Self::toolsdb_url(my_cnf, &database, Self::pool_max(config)),
+            None => {
+                let info: DBConnectionInfo =
+                    toolsdb(database).map_err(|e| Self::my_cnf_error(e, None))?;
+                Ok(info.pool_max(Self::pool_max(config)).to_string())
+            }
+        }
+    }
+
+    /// Equivalent of `toolforge::db::toolsdb()` for an explicitly located
+    /// `replica.my.cnf`. The query parameters follow the Toolforge connection
+    /// handling policy, as the `toolforge` crate does.
+    fn toolsdb_url(my_cnf: &Path, database: &str, pool_max: usize) -> Result<String> {
+        let ini = Ini::load_from_file(my_cnf)
+            .map_err(|e| anyhow!("Reading {} failed: {e}", my_cnf.display()))?;
+        let client = ini
+            .section(Some("client"))
+            .ok_or_else(|| anyhow!("No [client] section in {}", my_cnf.display()))?;
+        let value = |key: &str| {
+            client
+                .get(key)
+                .ok_or_else(|| anyhow!("No '{key}' in {}", my_cnf.display()))
+        };
+        let user = value("user")?;
+        let password = value("password")?;
+        let host = match client.get("local") {
+            Some(_) => TOOLSDB_HOST_LOCAL,
+            None => TOOLSDB_HOST,
+        };
+        Ok(format!("mysql://{user}:{password}@{host}:3306/{database}?pool_min=0&pool_max={pool_max}&inactive_connection_ttl=1&ttl_check_interval=30"))
+    }
+
     /// Creates a single connection pool.
     /// An explicit `url` in the config takes precedence, which is useful for local
     /// development through SSH tunnels. Otherwise the connection info is derived from
-    /// `~/replica.my.cnf` via the `toolforge` crate, so no credentials are needed in
-    /// the config file.
-    fn prepare_pool(
-        name: &str,
-        config: &Value,
-        connection_info: impl FnOnce() -> toolforge::Result<DBConnectionInfo>,
-    ) -> Pool {
+    /// `replica.my.cnf`, so no credentials are needed in the config file.
+    fn prepare_pool(name: &str, config: &Value, url: impl FnOnce() -> Result<String>) -> Pool {
         let url = match config.get("url").and_then(|v| v.as_str()) {
             Some(url) => url.to_string(),
-            None => {
-                let info =
-                    connection_info().unwrap_or_else(|e| panic!("No {name} connection info: {e}"));
-                match config.get("max_connections").and_then(|v| v.as_u64()) {
-                    Some(max_connections) => info.pool_max(max_connections as usize),
-                    None => info,
-                }
-                .to_string()
-            }
+            None => url().unwrap_or_else(|e| panic!("No {name} connection info: {e}")),
         };
         Pool::from_url(&url).unwrap_or_else(|e| panic!("Creating {name} pool failed: {e}"))
     }
@@ -662,6 +736,70 @@ impl WdRc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes a `replica.my.cnf` to a unique temporary directory.
+    fn write_my_cnf(name: &str, contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wdrc_test_{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("replica.my.cnf");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_toolsdb_url() {
+        let path = write_my_cnf(
+            "toolsdb_url",
+            "[client]\nuser='u12345'\npassword='correcthorsebatterystaple'\n",
+        );
+        assert_eq!(
+            WdRc::toolsdb_url(&path, "s55078__wdrc_p", 8).unwrap(),
+            "mysql://u12345:correcthorsebatterystaple@tools.db.svc.wikimedia.cloud:3306/s55078__wdrc_p?pool_min=0&pool_max=8&inactive_connection_ttl=1&ttl_check_interval=30"
+        );
+    }
+
+    #[test]
+    fn test_toolsdb_url_local() {
+        // `local` in the cnf means connections go through a local tunnel.
+        let path = write_my_cnf(
+            "toolsdb_url_local",
+            "[client]\nuser='u12345'\npassword='pw'\nlocal='true'\n",
+        );
+        assert!(WdRc::toolsdb_url(&path, "db_p", 10)
+            .unwrap()
+            .contains("@tools.db.svc.local.wmftest.net:3306/db_p?"));
+    }
+
+    #[test]
+    fn test_toolsdb_url_errors() {
+        // A missing file, and a file without the fields we need, must not panic.
+        assert!(WdRc::toolsdb_url(Path::new("/nonexistent/replica.my.cnf"), "db_p", 10).is_err());
+        let path = write_my_cnf("toolsdb_url_errors", "[client]\nuser='u12345'\n");
+        assert!(WdRc::toolsdb_url(&path, "db_p", 10).is_err());
+    }
+
+    #[test]
+    fn test_my_cnf_path() {
+        // An explicit path in the config wins, even if it does not exist.
+        assert_eq!(
+            WdRc::my_cnf_path(&json!({"replica_my_cnf": "/tmp/somewhere/replica.my.cnf"})),
+            Some(PathBuf::from("/tmp/somewhere/replica.my.cnf"))
+        );
+        // Without config, fall back to the tool's path only if it exists,
+        // otherwise let the `toolforge` crate look in `$HOME`.
+        assert_eq!(
+            WdRc::my_cnf_path(&json!({})),
+            Path::new(REPLICA_MY_CNF)
+                .exists()
+                .then(|| PathBuf::from(REPLICA_MY_CNF))
+        );
+    }
+
+    #[test]
+    fn test_pool_max() {
+        assert_eq!(WdRc::pool_max(&json!({"max_connections": 8})), 8);
+        assert_eq!(WdRc::pool_max(&json!({})), DEFAULT_POOL_MAX);
+    }
 
     #[tokio::test]
     #[ignore = "requires a local config.json and live access to the wdrc database"]

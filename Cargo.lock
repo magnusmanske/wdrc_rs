@@ -2991,6 +2991,7 @@ dependencies = [
  "anyhow",
  "futures",
  "mysql_async",
+ "rust-ini",
  "serde",
  "serde_json",
  "tokio",

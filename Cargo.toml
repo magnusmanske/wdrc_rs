@@ -12,6 +12,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 futures = "*"
 mysql_async = "0.36"
+rust-ini = "0.20"
 toolforge = { version = "5", features = ["mysql"] }
 wikimisc = { git = "https://github.com/magnusmanske/wikimisc.git", features = [
     "date",

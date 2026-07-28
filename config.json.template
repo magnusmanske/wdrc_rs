@@ -1,4 +1,5 @@
 {
+	"replica_my_cnf": "/data/project/wdrc/replica.my.cnf",
 	"wikidata": {
 		"database": "wikidatawiki",
 		"max_connections": 2
