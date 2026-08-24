@@ -69,6 +69,9 @@ const QUERY_WINDOW: Duration = Duration::from_secs(60 * 60);
 const NO_WINDOW_END: &str = "99991231235959";
 /// Row limit for the deletion and redirect queries.
 const AUX_QUERY_LIMIT: usize = 5000;
+/// Upsert for a `meta` row. A plain `UPDATE` silently matches nothing for a key
+/// that has no row yet, which would leave that cursor stuck at its fallback.
+const META_UPSERT_SQL: &str = "INSERT INTO `meta` (`key`,`value`) VALUES (?,?) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)";
 /// `meta` keys holding the processing cursors.
 const META_RC_TIMESTAMP: &str = "timestamp";
 const META_RC_ID: &str = "rc_id";
@@ -215,14 +218,28 @@ impl WdRc {
         })
     }
 
-    /// The `rc_id` is stored first: should the second write fail, the next run
-    /// re-reads rows it has already stored, which is safe, rather than skipping
-    /// rows it has not.
-    async fn set_rc_cursor(&self, cursor: &RcCursor) -> Result<()> {
+    /// Stores a batch and advances the cursor in one transaction.
+    ///
+    /// All of it must land together: `labels` has no unique key to absorb a
+    /// repeat, so a failure between the inserts and the cursor write would
+    /// duplicate every row of the batch on the next pass.
+    async fn store_batch(&self, statements: &[String], cursor: &RcCursor) -> Result<()> {
         let timestamp = Self::sanitize_timestamp(&cursor.timestamp)?;
-        self.set_key_value(META_RC_ID, &cursor.rc_id.to_string())
-            .await?;
-        self.set_key_value(META_RC_TIMESTAMP, timestamp).await
+        let timeout = self.db_timeout;
+        let pool = &self.wdrc_pool;
+        Self::with_timeout(timeout, "store_batch", async {
+            let mut tx = pool.start_transaction(Default::default()).await?;
+            for sql in statements {
+                tx.exec_drop(sql.as_str(), ()).await?;
+            }
+            tx.exec_drop(META_UPSERT_SQL, (META_RC_ID, cursor.rc_id.to_string()))
+                .await?;
+            tx.exec_drop(META_UPSERT_SQL, (META_RC_TIMESTAMP, timestamp))
+                .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn get_recent_changes(&self, from: &RcCursor) -> Result<RecentChangesResults> {
@@ -317,7 +334,7 @@ impl WdRc {
             .collect()
     }
 
-    async fn log_new_items(&self, rc: &RecentChangesResults) -> Result<()> {
+    fn new_item_statements(rc: &RecentChangesResults) -> Vec<String> {
         let mut creations = vec![];
         let mut item_ids = vec![];
         for new_item in rc.new_items() {
@@ -330,21 +347,13 @@ impl WdRc {
             item_ids.push(q.to_string());
             creations.push(format!("({q},'{ts}')"));
         }
-        if creations.is_empty() {
-            return Ok(());
-        }
-        let mut statements = Self::chunked_statements(
-            "REPLACE INTO `creations` (`q`,`timestamp`)",
-            &creations,
-        );
+        let mut statements =
+            Self::chunked_statements("REPLACE INTO `creations` (`q`,`timestamp`)", &creations);
         // A recreated item is no longer deleted.
         statements.extend(item_ids.chunks(ROWS_PER_INSERT).map(|chunk| {
-            format!(
-                "DELETE FROM `deletions` WHERE `q` IN ({})",
-                chunk.join(",")
-            )
+            format!("DELETE FROM `deletions` WHERE `q` IN ({})", chunk.join(","))
         }));
-        self.exec_all("log_new_items", &statements).await
+        statements
     }
 
     /// Fetches the revisions of a group of items in a single API request and
@@ -389,7 +398,10 @@ impl WdRc {
         Ok(changes)
     }
 
-    async fn log_recent_changes(&mut self, rc: &RecentChangesResults) -> Result<()> {
+    /// Diffs every changed item of the batch and returns the SQL that records
+    /// the result. Nothing is written here: the caller stores the whole batch
+    /// atomically together with the cursor.
+    async fn change_statements(&mut self, rc: &RecentChangesResults) -> Result<Vec<String>> {
         // Without a parent revision (imported or undeleted edits) there is
         // nothing to compare against.
         let items: Vec<&ChangedItem> = rc
@@ -398,7 +410,7 @@ impl WdRc {
             .filter(|ci| ci.rev_old() != 0 && ci.rev_new() != 0)
             .collect();
         if items.is_empty() {
-            return Ok(());
+            return Ok(vec![]);
         }
         let api = self.api.clone();
         let requests = items
@@ -421,7 +433,7 @@ impl WdRc {
             changes.len(),
             items.len()
         ));
-        self.log_changes(&changes).await
+        self.change_sql(&changes).await
     }
 
     /// Writes an auxiliary batch and advances the cursor it was read with.
@@ -632,14 +644,16 @@ impl WdRc {
         )
     }
 
-    async fn log_changes(&mut self, changes: &[Change]) -> Result<()> {
+    /// Resolving text ids does write to `texts`, outside the batch transaction:
+    /// an unused row there is harmless, and the label rows reference it.
+    async fn change_sql(&mut self, changes: &[Change]) -> Result<Vec<String>> {
         if changes.is_empty() {
-            return Ok(());
+            return Ok(vec![]);
         }
         self.resolve_text_ids(changes).await?;
         let mut statements = Self::build_statement_inserts(changes);
         statements.append(&mut Self::build_label_inserts(changes, &self.text_cache));
-        self.exec_all("log_changes", &statements).await
+        Ok(statements)
     }
 
     /// Makes sure every language and site name used by `changes` has a `texts`
@@ -737,10 +751,8 @@ impl WdRc {
         .await
     }
 
-    /// Upsert: a plain `UPDATE` silently matches no rows for a key that has no
-    /// row yet, which would leave that cursor stuck at its fallback value.
     async fn set_key_value(&self, key: &str, value: &str) -> Result<()> {
-        let sql = "INSERT INTO `meta` (`key`,`value`) VALUES (?,?) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)";
+        let sql = META_UPSERT_SQL;
         let timeout = self.db_timeout;
         let pool = &self.wdrc_pool;
         Self::with_timeout(timeout, &format!("set_key_value({key})"), async {
@@ -887,10 +899,9 @@ impl WdRc {
         let from = self.get_rc_cursor().await?;
         let rc = self.get_recent_changes(&from).await?;
         if let Some(cursor) = rc.cursor() {
-            self.log_recent_changes(&rc).await?;
-            self.log_new_items(&rc).await?;
-            // The cursor only moves once this batch is stored.
-            self.set_rc_cursor(cursor).await?;
+            let mut statements = self.change_statements(&rc).await?;
+            statements.append(&mut Self::new_item_statements(&rc));
+            self.store_batch(&statements, cursor).await?;
             // Keep going without sleeping while batches fill up, or while the
             // cursor is still far behind the present.
             more_work |= rc.row_count() >= self.max_recent_changes as usize
