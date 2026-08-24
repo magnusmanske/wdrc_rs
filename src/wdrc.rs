@@ -1,7 +1,11 @@
 use crate::{
     change::{Change, ChangeSubject},
-    recent_changes::{RecentChanges, RecentChangesResults, RecentDeletions, RecentRedirects},
-    revision_compare::RevisionCompare,
+    recent_changes::{
+        ChangedItem, RcCursor, RecentChanges, RecentChangesResults, RecentDeletions,
+        RecentRedirects,
+    },
+    revision_compare::{RevisionCompare, RevisionId},
+    wikidata_api::{WikidataApi, MAX_REVIDS_PER_REQUEST},
 };
 use anyhow::{anyhow, Result};
 use futures::{join, StreamExt};
@@ -9,15 +13,14 @@ use ini::Ini;
 use mysql_async::{from_row, prelude::Queryable, Pool};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs::File,
     io::BufReader,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use toolforge::db::{get_db_connection_info, toolsdb, Cluster, DBConnectionInfo};
-use wikimisc::{timestamp::TimeStamp, wikidata::Wikidata};
+use wikimisc::timestamp::TimeStamp;
 
 pub type TextId = u64;
 pub type ItemId = u64;
@@ -25,9 +28,9 @@ pub type ItemId = u64;
 /// Returned from `run_once` to indicate whether the bot should sleep or immediately process more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunResult {
-    /// The batch was full — there is likely more work waiting. Don't sleep.
+    /// There is more work waiting. Don't sleep.
     MoreWork,
-    /// The batch was not full — we've caught up. Sleep before next iteration.
+    /// We've caught up. Sleep before next iteration.
     CaughtUp,
 }
 
@@ -45,67 +48,115 @@ const DEFAULT_POOL_MAX: usize = 10;
 const TOOLSDB_HOST: &str = "tools.db.svc.wikimedia.cloud";
 const TOOLSDB_HOST_LOCAL: &str = "tools.db.svc.local.wmftest.net";
 
-const MAX_RECENT_CHANGES: u64 = 500;
-const MAX_API_CONCURRENT: u64 = 50;
+/// `recentchanges` rows per batch. Each batch costs one cursor round trip, so
+/// larger batches catch up faster; the API requests within a batch are what
+/// bounds the work, and they are grouped and run concurrently.
+const MAX_RECENT_CHANGES: u64 = 5000;
+/// Concurrent Wikidata API requests, each covering `ITEMS_PER_API_REQUEST` items.
+const MAX_API_CONCURRENT: u64 = 8;
+/// Items per API request: every item needs two revisions, and the API caps a
+/// request at `MAX_REVIDS_PER_REQUEST` revision IDs.
+const ITEMS_PER_API_REQUEST: usize = MAX_REVIDS_PER_REQUEST / 2;
+/// Wait before retrying a failed API request. One retry is worthwhile because a
+/// failure would otherwise drop a whole group of items.
+const API_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Rows per INSERT statement, to stay well below the server's `max_allowed_packet`.
+const ROWS_PER_INSERT: usize = 2000;
+/// Upper bound of the time window a single query looks at, which keeps range
+/// scans on `recentchanges` bounded.
+const QUERY_WINDOW: Duration = Duration::from_secs(60 * 60);
+/// A timestamp far enough in the future to act as "no upper bound".
+const NO_WINDOW_END: &str = "99991231235959";
+/// Row limit for the deletion and redirect queries.
+const AUX_QUERY_LIMIT: usize = 5000;
+/// `meta` keys holding the processing cursors.
+const META_RC_TIMESTAMP: &str = "timestamp";
+const META_RC_ID: &str = "rc_id";
+const META_REDIRECT: &str = "timestamp_redirect";
+const META_DELETION: &str = "timestamp_deletion";
 /// Default timeout for individual DB queries (seconds)
 const DEFAULT_DB_TIMEOUT_SEC: u64 = 300;
 /// Default timeout for entire run_once cycle (seconds)
 const DEFAULT_RUN_TIMEOUT_SEC: u64 = 600;
 /// Default sleep between bot loop iterations (seconds)
 const DEFAULT_BOT_SLEEP_SEC: u64 = 10;
+/// Default interval between deletion/redirect refreshes (seconds). Those change
+/// slowly compared to recent changes, and their queries are comparatively
+/// expensive, so they don't run on every pass of a catch-up loop.
+const DEFAULT_AUX_INTERVAL_SEC: u64 = 300;
+/// A cursor further behind than this means there is more work to do, even if the
+/// last batch was not full. Comfortably above normal replica lag.
+const CATCHUP_TOLERANCE: Duration = Duration::from_secs(600);
+
+/// The span of `recentchanges` rows the replica currently holds. The table keeps
+/// only a rolling window, and the replica may lag behind the live database, so
+/// both ends matter when moving a cursor over it.
+#[derive(Debug, Clone)]
+struct ReplicaRange {
+    oldest: String,
+    newest: String,
+}
+
+/// One batch of rows for `deletions` or `redirects`.
+#[derive(Debug)]
+struct AuxBatch {
+    updates: Vec<String>,
+    /// Where the next batch resumes.
+    cursor: String,
+    /// More rows are waiting, so don't wait for the next interval.
+    pending: bool,
+}
 
 #[derive(Debug)]
 pub struct WdRc {
     text_cache: HashMap<String, TextId>,
-    wd: Arc<Wikidata>,
+    api: WikidataApi,
     wikidata_pool: Pool,
     wdrc_pool: Pool,
+    wdrc_pool_max: usize,
     logging: bool,
     max_recent_changes: u64,
     max_api_concurrent: usize,
     db_timeout: Duration,
     run_timeout: Duration,
     bot_sleep: Duration,
+    aux_interval: Duration,
+    last_aux_run: Option<Instant>,
 }
 
 impl WdRc {
-    pub fn new(config_file: &str) -> WdRc {
-        let config = Self::read_config(config_file);
-        let db_timeout_sec = config
-            .get("db_timeout_sec")
-            .and_then(|j| j.as_u64())
-            .unwrap_or(DEFAULT_DB_TIMEOUT_SEC);
-        let run_timeout_sec = config
-            .get("run_timeout_sec")
-            .and_then(|j| j.as_u64())
-            .unwrap_or(DEFAULT_RUN_TIMEOUT_SEC);
-        let bot_sleep_sec = config
-            .get("bot_sleep_sec")
-            .and_then(|j| j.as_u64())
-            .unwrap_or(DEFAULT_BOT_SLEEP_SEC);
-        let (wikidata_pool, wdrc_pool) = Self::prepare_pools(&config);
-        WdRc {
+    pub fn new(config_file: &str) -> Result<WdRc> {
+        let config = Self::read_config(config_file)?;
+        let config_u64 = |key: &str, default: u64| {
+            config
+                .get(key)
+                .and_then(|j| j.as_u64())
+                .unwrap_or(default)
+        };
+        let max_api_concurrent = config_u64("max_api_concurrent", MAX_API_CONCURRENT) as usize;
+        let (wikidata_pool, wdrc_pool, wdrc_pool_max) = Self::prepare_pools(&config)?;
+        Ok(WdRc {
             text_cache: HashMap::new(),
-            wd: Self::prepare_wd(),
+            api: WikidataApi::new(max_api_concurrent)?,
             wikidata_pool,
             wdrc_pool,
+            wdrc_pool_max,
             logging: config
                 .get("logging")
                 .unwrap_or(&json!(false))
                 .as_bool()
                 .unwrap_or(false),
-            max_recent_changes: config
-                .get("max_recent_changes")
-                .and_then(|j| j.as_u64())
-                .unwrap_or(MAX_RECENT_CHANGES),
-            max_api_concurrent: config
-                .get("max_api_concurrent")
-                .and_then(|j| j.as_u64())
-                .unwrap_or(MAX_API_CONCURRENT) as usize,
-            db_timeout: Duration::from_secs(db_timeout_sec),
-            run_timeout: Duration::from_secs(run_timeout_sec),
-            bot_sleep: Duration::from_secs(bot_sleep_sec),
-        }
+            max_recent_changes: config_u64("max_recent_changes", MAX_RECENT_CHANGES),
+            max_api_concurrent,
+            db_timeout: Duration::from_secs(config_u64("db_timeout_sec", DEFAULT_DB_TIMEOUT_SEC)),
+            run_timeout: Duration::from_secs(config_u64("run_timeout_sec", DEFAULT_RUN_TIMEOUT_SEC)),
+            bot_sleep: Duration::from_secs(config_u64("bot_sleep_sec", DEFAULT_BOT_SLEEP_SEC)),
+            aux_interval: Duration::from_secs(config_u64(
+                "aux_interval_sec",
+                DEFAULT_AUX_INTERVAL_SEC,
+            )),
+            last_aux_run: None,
+        })
     }
 
     fn log(&self, msg: String) {
@@ -131,33 +182,84 @@ impl WdRc {
         }
     }
 
-    pub async fn get_recent_changes(&self) -> Result<RecentChangesResults> {
-        let oldest = self.get_key_value("timestamp").await?.unwrap_or_default();
-        let results = self.get_next_recent_changes_batch(&oldest).await?;
+    /// End of the time window starting at `oldest`, as a MediaWiki timestamp.
+    fn window_end(oldest: &str) -> String {
+        TimeStamp::str2utc(oldest)
+            .map(|dt| dt + QUERY_WINDOW)
+            .map(|dt| TimeStamp::datetime(&dt))
+            .unwrap_or_else(|| NO_WINDOW_END.to_string())
+    }
+
+    /// True if `timestamp` lies further in the past than `CATCHUP_TOLERANCE`.
+    /// Timestamps are fixed-width and numeric, so they compare lexicographically.
+    fn is_behind(timestamp: &str) -> bool {
+        match TimeStamp::str2utc(&TimeStamp::now()).map(|now| now - CATCHUP_TOLERANCE) {
+            Some(cutoff) => timestamp < TimeStamp::datetime(&cutoff).as_str(),
+            None => false,
+        }
+    }
+
+    /// Reads the cursor. A missing `rc_id` starts at 0, which makes the first
+    /// batch re-read its timestamp's second, exactly as before this was tracked.
+    async fn get_rc_cursor(&self) -> Result<RcCursor> {
+        Ok(RcCursor {
+            timestamp: self
+                .get_key_value(META_RC_TIMESTAMP)
+                .await?
+                .unwrap_or_default(),
+            rc_id: self
+                .get_key_value(META_RC_ID)
+                .await?
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// The `rc_id` is stored first: should the second write fail, the next run
+    /// re-reads rows it has already stored, which is safe, rather than skipping
+    /// rows it has not.
+    async fn set_rc_cursor(&self, cursor: &RcCursor) -> Result<()> {
+        let timestamp = Self::sanitize_timestamp(&cursor.timestamp)?;
+        self.set_key_value(META_RC_ID, &cursor.rc_id.to_string())
+            .await?;
+        self.set_key_value(META_RC_TIMESTAMP, timestamp).await
+    }
+
+    async fn get_recent_changes(&self, from: &RcCursor) -> Result<RecentChangesResults> {
+        let results = self.get_next_recent_changes_batch(from).await?;
         let rc = RecentChangesResults::new(&results);
         self.log(format!(
-            "New: {}, changed:{}",
+            "{} rows from {}/{}; new: {}, changed: {}",
+            rc.row_count(),
+            from.timestamp,
+            from.rc_id,
             rc.new_items().len(),
             rc.changed_items().len()
         ));
-
-        // Determine and set new oldest timestamp
         Ok(rc)
     }
 
-    async fn get_next_recent_changes_batch(&self, oldest: &str) -> Result<Vec<RecentChanges>> {
-        let upper_limit = TimeStamp::str2utc(oldest)
-            .map(|dt| dt + Duration::from_secs(60 * 60))
-            .map(|dt| TimeStamp::datetime(&dt))
-            .unwrap_or("99991231235900".to_string());
-        let sql = "SELECT `rc_source`,`rc_timestamp`,`rc_title`,`rc_this_oldid`,`rc_last_oldid` FROM `recentchanges` WHERE `rc_namespace`=0 AND `rc_timestamp`>=? AND rc_timestamp<=? ORDER BY `rc_timestamp`,`rc_title`,`rc_id` LIMIT ?";
+    async fn get_next_recent_changes_batch(&self, from: &RcCursor) -> Result<Vec<RecentChanges>> {
+        let window_end = Self::window_end(&from.timestamp);
+        // Keyset pagination: the range condition on `rc_timestamp` uses the
+        // index, and the disjunction then excludes the rows of the boundary
+        // second that were already read.
+        let sql = "SELECT `rc_id`,`rc_source`,`rc_timestamp`,`rc_title`,`rc_this_oldid`,`rc_last_oldid` FROM `recentchanges`
+			WHERE `rc_namespace`=0 AND `rc_timestamp`>=? AND `rc_timestamp`<=? AND (`rc_timestamp`>? OR `rc_id`>?)
+			ORDER BY `rc_timestamp`,`rc_id` LIMIT ?";
         let timeout = self.db_timeout;
         let pool = &self.wikidata_pool;
-        let max_rc = &self.max_recent_changes;
+        let params = (
+            &from.timestamp,
+            &window_end,
+            &from.timestamp,
+            from.rc_id,
+            self.max_recent_changes,
+        );
         Self::with_timeout(timeout, "get_next_recent_changes_batch", async {
             let mut conn = pool.get_conn().await?;
             let results: Vec<RecentChanges> = conn
-                .exec_iter(sql, (oldest, &upper_limit, max_rc))
+                .exec_iter(sql, params)
                 .await?
                 .map_and_drop(RecentChanges::from_row)
                 .await?
@@ -188,132 +290,228 @@ impl WdRc {
         Ok(q)
     }
 
-    pub async fn log_new_items(&self, rc: &RecentChangesResults) -> Result<()> {
-        if rc.new_items().is_empty() {
-            return Ok(());
-        }
-        let mut updates = vec![];
-        let mut delete_from_deleted = vec![];
-        for new_item in rc.new_items() {
-            let q = Self::make_id_numeric(new_item.q())?;
-            let ts = new_item.timestamp();
-            if Self::sanitize_timestamp(ts).is_err() {
-                continue;
-            }
-            delete_from_deleted.push(format!("{q}"));
-            updates.push(format!("({q},'{ts}')"));
-        }
-        let updates = updates.join(",");
-        let delete_from_deleted = delete_from_deleted.join(",");
-
-        // Write changes to DB in parallel (different tables, no ordering dependency)
-        let timeout = self.db_timeout;
-        let pool = &self.wdrc_pool;
-        let create_sql = format!("REPLACE INTO `creations` (`q`,`timestamp`) VALUES {updates}");
-        let delete_sql = format!("DELETE FROM `deletions` WHERE `q` IN ({delete_from_deleted})");
-
-        let create_fut = Self::with_timeout(timeout, "log_new_items/creations", async {
-            pool.get_conn().await?.exec_drop(&create_sql, ()).await?;
-            Ok(())
-        });
-        let delete_fut = Self::with_timeout(timeout, "log_new_items/deletions", async {
-            pool.get_conn().await?.exec_drop(&delete_sql, ()).await?;
-            Ok(())
-        });
-        let (r1, r2) = join!(create_fut, delete_fut);
-        r1?;
-        r2?;
-        Ok(())
+    /// Splits `rows` into statements of at most `ROWS_PER_INSERT` rows, so that a
+    /// large batch cannot exceed the server's `max_allowed_packet`.
+    fn chunked_statements(prefix: &str, rows: &[String]) -> Vec<String> {
+        rows.chunks(ROWS_PER_INSERT)
+            .map(|chunk| format!("{prefix} VALUES {}", chunk.join(",")))
+            .collect()
     }
 
-    pub async fn log_recent_changes(&mut self, rc: &RecentChangesResults) -> Result<()> {
-        if rc.changed_items().is_empty() {
+    /// Runs independent statements against the tool database, as many at a time
+    /// as the connection pool allows. Returns the first error, if any.
+    async fn exec_all(&self, label: &str, statements: &[String]) -> Result<()> {
+        let timeout = self.db_timeout;
+        let pool = &self.wdrc_pool;
+        let queries = statements.iter().map(|sql| {
+            Self::with_timeout(timeout, label, async {
+                pool.get_conn().await?.exec_drop(sql.as_str(), ()).await?;
+                Ok(())
+            })
+        });
+        futures::stream::iter(queries)
+            .buffer_unordered(self.wdrc_pool_max)
+            .collect::<Vec<Result<()>>>()
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    async fn log_new_items(&self, rc: &RecentChangesResults) -> Result<()> {
+        let mut creations = vec![];
+        let mut item_ids = vec![];
+        for new_item in rc.new_items() {
+            let (Ok(q), Ok(ts)) = (
+                Self::make_id_numeric(new_item.q()),
+                Self::sanitize_timestamp(new_item.timestamp()),
+            ) else {
+                continue;
+            };
+            item_ids.push(q.to_string());
+            creations.push(format!("({q},'{ts}')"));
+        }
+        if creations.is_empty() {
             return Ok(());
         }
-        let wd = self.wd.clone();
-        let futures = rc.changed_items().iter().map(|ci| {
-            let mut revision_compare = RevisionCompare::new(wd.clone());
-            async move { revision_compare.run(ci).await }
-        });
-        let stream = futures::stream::iter(futures).buffer_unordered(self.max_api_concurrent);
-        let changes: Vec<Change> = stream
+        let mut statements = Self::chunked_statements(
+            "REPLACE INTO `creations` (`q`,`timestamp`)",
+            &creations,
+        );
+        // A recreated item is no longer deleted.
+        statements.extend(item_ids.chunks(ROWS_PER_INSERT).map(|chunk| {
+            format!(
+                "DELETE FROM `deletions` WHERE `q` IN ({})",
+                chunk.join(",")
+            )
+        }));
+        self.exec_all("log_new_items", &statements).await
+    }
+
+    /// Fetches the revisions of a group of items in a single API request and
+    /// compares each pair. Grouping is what keeps the request count low; the
+    /// alternative, one request per item, also risked losing items whose
+    /// revision span exceeded the API's default revision limit.
+    async fn changes_for_items(api: &WikidataApi, items: &[&ChangedItem]) -> Result<Vec<Change>> {
+        let revision_ids: Vec<RevisionId> = items
+            .iter()
+            .flat_map(|ci| [ci.rev_old(), ci.rev_new()])
+            .collect::<BTreeSet<RevisionId>>()
+            .into_iter()
+            .collect();
+        let revisions = match api.get_revisions(&revision_ids).await {
+            Ok(revisions) => revisions,
+            Err(first) => {
+                tokio::time::sleep(API_RETRY_DELAY).await;
+                api.get_revisions(&revision_ids)
+                    .await
+                    .map_err(|e| anyhow!("{first}; on retry: {e}"))?
+            }
+        };
+        let mut changes = vec![];
+        for ci in items {
+            let compare = match RevisionCompare::new(ci) {
+                Ok(compare) => compare,
+                Err(e) => {
+                    eprintln!("Skipping {}: {e}", ci.q());
+                    continue;
+                }
+            };
+            match (revisions.get(&ci.rev_old()), revisions.get(&ci.rev_new())) {
+                (Some(old), Some(new)) => changes.append(&mut compare.compare_revisions(old, new)),
+                _ => eprintln!(
+                    "Skipping {}: revisions {} and {} not both available",
+                    ci.q(),
+                    ci.rev_old(),
+                    ci.rev_new()
+                ),
+            }
+        }
+        Ok(changes)
+    }
+
+    async fn log_recent_changes(&mut self, rc: &RecentChangesResults) -> Result<()> {
+        // Without a parent revision (imported or undeleted edits) there is
+        // nothing to compare against.
+        let items: Vec<&ChangedItem> = rc
+            .changed_items()
+            .iter()
+            .filter(|ci| ci.rev_old() != 0 && ci.rev_new() != 0)
+            .collect();
+        if items.is_empty() {
+            return Ok(());
+        }
+        let api = self.api.clone();
+        let requests = items
+            .chunks(ITEMS_PER_API_REQUEST)
+            .map(|group| Self::changes_for_items(&api, group));
+        let changes: Vec<Change> = futures::stream::iter(requests)
+            .buffer_unordered(self.max_api_concurrent)
             .collect::<Vec<_>>()
             .await
             .into_iter()
-            .filter_map(|r| r.ok())
+            .filter_map(|result| {
+                result
+                    .map_err(|e| eprintln!("Revision group failed: {e}"))
+                    .ok()
+            })
             .flatten()
             .collect();
-        self.log(format!("CHANGES: {}", changes.len()));
-
-        self.log_changes(&changes).await?;
-        let new_oldest = rc.get_last_rc_timetamp("20000101000000");
-        let _ = self.set_key_value("timestamp", &new_oldest).await;
-        Ok(())
+        self.log(format!(
+            "CHANGES: {} from {} items",
+            changes.len(),
+            items.len()
+        ));
+        self.log_changes(&changes).await
     }
 
-    pub async fn update_recent_redirects(&self) -> Result<()> {
-        let (updates, new_ts) = Self::with_timeout(
+    /// Writes an auxiliary batch and advances the cursor it was read with.
+    async fn store_aux_batch(
+        &self,
+        cursor_key: &str,
+        table_and_columns: &str,
+        batch: &AuxBatch,
+    ) -> Result<()> {
+        if !batch.updates.is_empty() {
+            self.log(format!("{cursor_key}: {} changes", batch.updates.len()));
+            let statements = Self::chunked_statements(
+                &format!("REPLACE INTO {table_and_columns}"),
+                &batch.updates,
+            );
+            self.exec_all(cursor_key, &statements).await?;
+        }
+        self.set_key_value(cursor_key, Self::sanitize_timestamp(&batch.cursor)?)
+            .await
+    }
+
+    /// Returns `true` while more redirects are waiting to be read.
+    async fn update_recent_redirects(&self, available: &ReplicaRange) -> Result<bool> {
+        let batch = Self::with_timeout(
             self.db_timeout,
-            "update_recent_redirects_get_updates",
-            self.update_recent_redirects_get_updates(),
+            "recent_redirects_batch",
+            self.recent_redirects_batch(available),
         )
         .await?;
-        if updates.is_empty() {
-            return Ok(());
-        }
-        self.log(format!("REDIRECTS: {} changes", updates.len()));
-
-        let updates = updates.join(",");
-        let sql =
-            format!("REPLACE INTO `redirects` (`source`,`target`,`timestamp`) VALUES {updates}");
-        let timeout = self.db_timeout;
-        let pool = &self.wdrc_pool;
-        Self::with_timeout(timeout, "update_recent_redirects write", async {
-            pool.get_conn().await?.exec_drop(&sql, ()).await?;
-            Ok(())
-        })
+        self.store_aux_batch(
+            META_REDIRECT,
+            "`redirects` (`source`,`target`,`timestamp`)",
+            &batch,
+        )
         .await?;
-        self.set_key_value("timestamp_redirect", &new_ts).await?;
-        Ok(())
+        Ok(batch.pending)
     }
 
-    async fn update_recent_redirects_get_updates(&self) -> Result<(Vec<String>, String)> {
+    async fn recent_redirects_batch(&self, available: &ReplicaRange) -> Result<AuxBatch> {
+        // `recentchanges` only keeps a rolling window, so a cursor older than
+        // its first row can never be satisfied and would otherwise crawl
+        // forward one window at a time for years.
         let oldest = self
-            .get_key_value("timestamp_redirect")
+            .get_key_value(META_REDIRECT)
             .await?
-            .unwrap_or_else(|| "20000101000000".to_string());
-        let results = self.get_recent_redirects(&oldest).await?;
+            .unwrap_or_default()
+            .max(available.oldest.clone());
+        let window_end = Self::window_end(&oldest);
+        let results = self.get_recent_redirects(&oldest, &window_end).await?;
+        let truncated = results.len() >= AUX_QUERY_LIMIT;
+        // A window that was read in full may be skipped past even when it held
+        // nothing, but never past what the replica has: while replication lags,
+        // rows for an apparently empty window can still arrive.
+        let mut cursor = match truncated {
+            true => oldest,
+            false => window_end.clone().min(available.newest.clone()),
+        };
         let mut updates = vec![];
-        let mut new_ts = oldest;
         for result in &results {
-            let source = match Self::make_id_numeric(result.source()) {
-                Ok(q) => q,
-                Err(_) => continue,
-            };
-            let target = match Self::make_id_numeric(result.target()) {
-                Ok(q) => q,
-                Err(_) => continue,
-            };
-            let ts = result.timestamp().to_string();
-            if new_ts < ts {
-                new_ts = ts;
-            }
-            if Self::sanitize_timestamp(result.timestamp()).is_err() {
+            let (Ok(source), Ok(target), Ok(ts)) = (
+                Self::make_id_numeric(result.source()),
+                Self::make_id_numeric(result.target()),
+                Self::sanitize_timestamp(result.timestamp()),
+            ) else {
                 continue;
+            };
+            if cursor.as_str() < ts {
+                cursor = ts.to_string();
             }
-            updates.push(format!("({source},{target},'{}')", result.timestamp()));
+            updates.push(format!("({source},{target},'{ts}')"));
         }
-        Ok((updates, new_ts))
+        Ok(AuxBatch {
+            updates,
+            pending: truncated || window_end < available.newest,
+            cursor,
+        })
     }
 
-    async fn get_recent_redirects(&self, oldest: &str) -> Result<Vec<RecentRedirects>> {
+    async fn get_recent_redirects(
+        &self,
+        oldest: &str,
+        window_end: &str,
+    ) -> Result<Vec<RecentRedirects>> {
         let sql = "SELECT `rc_title` AS `source`,`rd_title` AS `target`,max(`rc_timestamp`) AS `timestamp` FROM `recentchanges`,`redirect`
-			WHERE `rc_namespace`=0 AND `rd_from`=`rc_cur_id` AND `rd_namespace`=0 AND `rc_timestamp`>=? GROUP BY `source`,`target` ORDER BY `timestamp` LIMIT 5000";
+			WHERE `rc_namespace`=0 AND `rd_from`=`rc_cur_id` AND `rd_namespace`=0 AND `rc_timestamp`>=? AND `rc_timestamp`<=? GROUP BY `source`,`target` ORDER BY `timestamp` LIMIT ?";
         let results: Vec<RecentRedirects> = self
             .wikidata_pool
             .get_conn()
             .await?
-            .exec_iter(sql, (oldest,))
+            .exec_iter(sql, (oldest, window_end, AUX_QUERY_LIMIT))
             .await?
             .map_and_drop(RecentRedirects::from_row)
             .await?
@@ -323,63 +521,55 @@ impl WdRc {
         Ok(results)
     }
 
-    pub async fn update_recent_deletions(&self) -> Result<()> {
-        let (updates, new_ts) = Self::with_timeout(
+    /// Returns `true` while more deletions are waiting to be read.
+    async fn update_recent_deletions(&self) -> Result<bool> {
+        let batch = Self::with_timeout(
             self.db_timeout,
-            "update_recent_deletions_get_updates",
-            self.update_recent_deletions_get_updates(),
+            "recent_deletions_batch",
+            self.recent_deletions_batch(),
         )
         .await?;
-        if updates.is_empty() {
-            return Ok(());
-        }
-        self.log(format!("DELETIONS: {} changes", updates.len()));
-
-        let updates = updates.join(",");
-        let sql = format!("REPLACE INTO `deletions` (`q`,`timestamp`) VALUES {updates}");
-        let timeout = self.db_timeout;
-        let pool = &self.wdrc_pool;
-        Self::with_timeout(timeout, "update_recent_deletions write", async {
-            pool.get_conn().await?.exec_drop(&sql, ()).await?;
-            Ok(())
-        })
-        .await?;
-        self.set_key_value("timestamp_deletion", &new_ts).await?;
-        Ok(())
+        self.store_aux_batch(META_DELETION, "`deletions` (`q`,`timestamp`)", &batch)
+            .await?;
+        Ok(batch.pending)
     }
 
-    async fn update_recent_deletions_get_updates(&self) -> Result<(Vec<String>, String)> {
+    async fn recent_deletions_batch(&self) -> Result<AuxBatch> {
+        // `logging` keeps its full history, so the cursor may start at the
+        // beginning of time and work forward a batch at a time.
         let oldest = self
-            .get_key_value("timestamp_deletion")
+            .get_key_value(META_DELETION)
             .await?
             .unwrap_or_else(|| "20000101000000".to_string());
         let results = self.get_recent_deletions(&oldest).await?;
+        let mut cursor = oldest;
         let mut updates = vec![];
-        let mut new_ts = oldest;
         for result in &results {
-            let q = match Self::make_id_numeric(result.q()) {
-                Ok(q) => q,
-                Err(_) => continue,
-            };
-            let ts = result.timestamp().to_string();
-            if new_ts < ts {
-                new_ts = ts;
-            }
-            if Self::sanitize_timestamp(result.timestamp()).is_err() {
+            let (Ok(q), Ok(ts)) = (
+                Self::make_id_numeric(result.q()),
+                Self::sanitize_timestamp(result.timestamp()),
+            ) else {
                 continue;
+            };
+            if cursor.as_str() < ts {
+                cursor = ts.to_string();
             }
-            updates.push(format!("({q},'{}')", result.timestamp()));
+            updates.push(format!("({q},'{ts}')"));
         }
-        Ok((updates, new_ts))
+        Ok(AuxBatch {
+            pending: results.len() >= AUX_QUERY_LIMIT,
+            updates,
+            cursor,
+        })
     }
 
     async fn get_recent_deletions(&self, oldest: &str) -> Result<Vec<RecentDeletions>> {
-        let sql = "SELECT `log_title` AS `q`,`log_timestamp` AS `timestamp` FROM `logging` WHERE `log_type`='delete' AND `log_action`='delete' AND `log_timestamp`>=? AND `log_namespace`=0 ORDER BY `log_timestamp` LIMIT 5000";
+        let sql = "SELECT `log_title` AS `q`,`log_timestamp` AS `timestamp` FROM `logging` WHERE `log_type`='delete' AND `log_action`='delete' AND `log_timestamp`>=? AND `log_namespace`=0 ORDER BY `log_timestamp` LIMIT ?";
         let results: Vec<RecentDeletions> = self
             .wikidata_pool
             .get_conn()
             .await?
-            .exec_iter(sql, (oldest,))
+            .exec_iter(sql, (oldest, AUX_QUERY_LIMIT))
             .await?
             .map_and_drop(RecentDeletions::from_row)
             .await?
@@ -389,164 +579,145 @@ impl WdRc {
         Ok(results)
     }
 
-    fn build_statement_sql(changes: &[Change]) -> Option<String> {
-        let values = changes
+    /// The span of `recentchanges` rows the replica currently holds, or `None`
+    /// if it holds none at all.
+    async fn recentchanges_range(&self) -> Result<Option<ReplicaRange>> {
+        let sql = "SELECT MIN(`rc_timestamp`),MAX(`rc_timestamp`) FROM `recentchanges`";
+        let timeout = self.db_timeout;
+        let pool = &self.wikidata_pool;
+        Self::with_timeout(timeout, "recentchanges_range", async {
+            let mut conn = pool.get_conn().await?;
+            let rows: Vec<(Option<String>, Option<String>)> = conn
+                .exec_iter(sql, ())
+                .await?
+                .map_and_drop(from_row::<(Option<String>, Option<String>)>)
+                .await?;
+            let range = match rows.into_iter().next() {
+                Some((Some(oldest), Some(newest))) => Some(ReplicaRange { oldest, newest }),
+                _ => None,
+            };
+            Ok(range)
+        })
+        .await
+    }
+
+    fn build_statement_inserts(changes: &[Change]) -> Vec<String> {
+        let rows: Vec<String> = changes
             .iter()
             .filter(|c| c.subject == ChangeSubject::Claims)
             .filter_map(|c| c.get_statement_log().ok())
-            .collect::<Vec<String>>();
-        if values.is_empty() {
-            return None;
-        }
-        Some(format!("INSERT IGNORE INTO `statements` (`item`,`revision`,`property`,`timestamp`,`change_type`) VALUES {}", values.join(",")))
+            .collect();
+        Self::chunked_statements(
+            "INSERT IGNORE INTO `statements` (`item`,`revision`,`property`,`timestamp`,`change_type`)",
+            &rows,
+        )
     }
 
-    fn build_labels_sql(
+    /// Labels, descriptions, aliases and sitelinks all live in the `labels`
+    /// table, keyed by the `texts` entry the change refers to.
+    fn build_label_inserts(
         changes: &[Change],
         text_cache: &HashMap<String, TextId>,
-        key_field: impl Fn(&Change) -> &str,
-        filter: impl Fn(&Change) -> bool,
-    ) -> Option<String> {
-        let parts: Vec<String> = changes
+    ) -> Vec<String> {
+        let rows: Vec<String> = changes
             .iter()
-            .filter(|c| filter(c))
-            .filter_map(|ci| {
-                let key = key_field(ci);
-                let text_id = text_cache.get(key)?;
-                ci.get_label_log(*text_id).ok()
+            .filter_map(|c| {
+                let text_id = text_cache.get(c.text_key()?)?;
+                c.get_label_log(*text_id).ok()
             })
             .collect();
-        if parts.is_empty() {
-            return None;
-        }
-        Some(format!(
-            "INSERT IGNORE INTO `labels` (`item`,`revision`,`type`,`timestamp`,`change_type`,`language`) VALUES {}",
-            parts.join(",")
-        ))
+        Self::chunked_statements(
+            "INSERT IGNORE INTO `labels` (`item`,`revision`,`type`,`timestamp`,`change_type`,`language`)",
+            &rows,
+        )
     }
 
     async fn log_changes(&mut self, changes: &[Change]) -> Result<()> {
-        // Phase 1: Ensure all text IDs are resolved (sequential, needs &mut self)
+        if changes.is_empty() {
+            return Ok(());
+        }
+        self.resolve_text_ids(changes).await?;
+        let mut statements = Self::build_statement_inserts(changes);
+        statements.append(&mut Self::build_label_inserts(changes, &self.text_cache));
+        self.exec_all("log_changes", &statements).await
+    }
+
+    /// Makes sure every language and site name used by `changes` has a `texts`
+    /// row, so that the rows written afterwards can all be resolved from cache.
+    async fn resolve_text_ids(&mut self, changes: &[Change]) -> Result<()> {
         self.cache_texts_in_memory().await?;
-        for ci in changes {
-            match ci.subject {
-                ChangeSubject::Sitelinks => {
-                    let _ = self.get_or_create_text_id(&ci.site).await;
-                }
-                ChangeSubject::Labels | ChangeSubject::Descriptions | ChangeSubject::Aliases => {
-                    let _ = self.get_or_create_text_id(&ci.language).await;
-                }
-                _ => {}
+        let missing: BTreeSet<String> = changes
+            .iter()
+            .filter_map(|c| c.text_key())
+            .filter(|key| !key.is_empty() && !self.text_cache.contains_key(*key))
+            .map(|key| key.to_string())
+            .collect();
+        for key in missing {
+            // Changes for an unwritable text are dropped, not fatal for the batch.
+            if let Err(e) = self.get_or_create_text_id(&key).await {
+                eprintln!("Could not create text entry {key:?}: {e}");
             }
         }
-
-        // Phase 2: Build all SQL statements (pure computation, no I/O)
-        let stmt_sql = Self::build_statement_sql(changes);
-        let sitelinks_sql = Self::build_labels_sql(
-            changes,
-            &self.text_cache,
-            |ci| &ci.site,
-            |c| c.subject == ChangeSubject::Sitelinks,
-        );
-        let labels_sql = Self::build_labels_sql(
-            changes,
-            &self.text_cache,
-            |ci| &ci.language,
-            |c| {
-                c.subject == ChangeSubject::Labels
-                    || c.subject == ChangeSubject::Descriptions
-                    || c.subject == ChangeSubject::Aliases
-            },
-        );
-
-        // Phase 3: Execute all DB writes in parallel
-        let timeout = self.db_timeout;
-        let pool = &self.wdrc_pool;
-
-        let stmt_fut = async {
-            if let Some(sql) = &stmt_sql {
-                Self::with_timeout(timeout, "log_statement_changes", async {
-                    pool.get_conn().await?.exec_drop(sql.as_str(), ()).await?;
-                    Ok(())
-                })
-                .await
-            } else {
-                Ok(())
-            }
-        };
-        let sitelinks_fut = async {
-            if let Some(sql) = &sitelinks_sql {
-                Self::with_timeout(timeout, "log_sitelinks_changes", async {
-                    pool.get_conn().await?.exec_drop(sql.as_str(), ()).await?;
-                    Ok(())
-                })
-                .await
-            } else {
-                Ok(())
-            }
-        };
-        let labels_fut = async {
-            if let Some(sql) = &labels_sql {
-                Self::with_timeout(timeout, "log_label_changes", async {
-                    pool.get_conn().await?.exec_drop(sql.as_str(), ()).await?;
-                    Ok(())
-                })
-                .await
-            } else {
-                Ok(())
-            }
-        };
-
-        let (r1, r2, r3) = join!(stmt_fut, sitelinks_fut, labels_fut);
-        r1?;
-        r2?;
-        r3?;
         Ok(())
     }
 
     async fn get_or_create_text_id(&mut self, text: &str) -> Result<TextId> {
         self.cache_texts_in_memory().await?;
-        match self.text_cache.get(text) {
-            Some(id) => Ok(*id),
-            None => {
-                let sql = "INSERT INTO `texts` (`value`) VALUES (?)";
-                let timeout = self.db_timeout;
-                let pool = &self.wdrc_pool;
-                let id = Self::with_timeout(timeout, "get_or_create_text_id", async {
-                    let mut conn = pool.get_conn().await?;
-                    conn.exec_drop(sql, (text,))
-                        .await
-                        .map_err(|e| anyhow!("Error inserting text: {}", e))?;
-                    let id = conn
-                        .last_insert_id()
-                        .ok_or_else(|| anyhow!("No text row inserted"))?;
-                    Ok(id)
-                })
-                .await?;
-                self.text_cache.insert(text.to_string(), id);
-                Ok(id)
-            }
+        if let Some(id) = self.text_cache.get(text) {
+            return Ok(*id);
         }
+        let id = self.insert_text(text).await?;
+        self.text_cache.insert(text.to_string(), id);
+        Ok(id)
+    }
+
+    /// `texts`.`value` is unique, so another process may have inserted the same
+    /// value in the meantime; in that case read the existing row.
+    async fn insert_text(&self, text: &str) -> Result<TextId> {
+        let timeout = self.db_timeout;
+        let pool = &self.wdrc_pool;
+        Self::with_timeout(timeout, "insert_text", async {
+            let mut conn = pool.get_conn().await?;
+            conn.exec_drop("INSERT IGNORE INTO `texts` (`value`) VALUES (?)", (text,))
+                .await
+                .map_err(|e| anyhow!("Error inserting text: {e}"))?;
+            match conn.last_insert_id() {
+                Some(id) if id > 0 => Ok(id),
+                _ => {
+                    let existing: Vec<TextId> = conn
+                        .exec_iter("SELECT `id` FROM `texts` WHERE `value`=?", (text,))
+                        .await?
+                        .map_and_drop(from_row::<TextId>)
+                        .await?;
+                    existing
+                        .first()
+                        .copied()
+                        .ok_or_else(|| anyhow!("No text row for {text:?}"))
+                }
+            }
+        })
+        .await
     }
 
     async fn cache_texts_in_memory(&mut self) -> Result<()> {
-        if self.text_cache.is_empty() {
-            let sql = "SELECT `value`,`id` FROM `texts`";
-            let timeout = self.db_timeout;
-            let pool = &self.wdrc_pool;
-            let result: Vec<(String, TextId)> =
-                Self::with_timeout(timeout, "cache_texts_in_memory", async {
-                    let mut conn = pool.get_conn().await?;
-                    let result: Vec<(String, TextId)> = conn
-                        .exec_iter(sql, ())
-                        .await?
-                        .map_and_drop(from_row::<(String, TextId)>)
-                        .await?;
-                    Ok(result)
-                })
-                .await?;
-            self.text_cache = result.into_iter().collect();
+        if !self.text_cache.is_empty() {
+            return Ok(());
         }
+        let sql = "SELECT `value`,`id` FROM `texts`";
+        let timeout = self.db_timeout;
+        let pool = &self.wdrc_pool;
+        let result: Vec<(String, TextId)> =
+            Self::with_timeout(timeout, "cache_texts_in_memory", async {
+                let mut conn = pool.get_conn().await?;
+                let result: Vec<(String, TextId)> = conn
+                    .exec_iter(sql, ())
+                    .await?
+                    .map_and_drop(from_row::<(String, TextId)>)
+                    .await?;
+                Ok(result)
+            })
+            .await?;
+        self.text_cache = result.into_iter().collect();
         Ok(())
     }
 
@@ -566,44 +737,44 @@ impl WdRc {
         .await
     }
 
+    /// Upsert: a plain `UPDATE` silently matches no rows for a key that has no
+    /// row yet, which would leave that cursor stuck at its fallback value.
     async fn set_key_value(&self, key: &str, value: &str) -> Result<()> {
-        let sql = "UPDATE `meta` SET `value`=? WHERE `key`=?";
+        let sql = "INSERT INTO `meta` (`key`,`value`) VALUES (?,?) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)";
         let timeout = self.db_timeout;
         let pool = &self.wdrc_pool;
         Self::with_timeout(timeout, &format!("set_key_value({key})"), async {
             let mut conn = pool.get_conn().await?;
-            conn.exec_drop(sql, (value, key)).await?;
+            conn.exec_drop(sql, (key, value)).await?;
             Ok(())
         })
         .await
     }
 
-    fn read_config(config_file: &str) -> Value {
-        let file =
-            File::open(config_file).unwrap_or_else(|e| panic!("Reading {config_file} failed: {e}"));
-        let reader = BufReader::new(file);
-        serde_json::from_reader(reader)
-            .unwrap_or_else(|e| panic!("Parsing {config_file} failed: {e}"))
+    fn read_config(config_file: &str) -> Result<Value> {
+        let file = File::open(config_file)
+            .map_err(|e| anyhow!("Reading {config_file} failed: {e}"))?;
+        serde_json::from_reader(BufReader::new(file))
+            .map_err(|e| anyhow!("Parsing {config_file} failed: {e}"))
     }
 
-    fn prepare_wd() -> Arc<Wikidata> {
-        let mut wd = Wikidata::new();
-        wd.set_user_agent("wdrc-rs/0.1.0");
-        Arc::new(wd)
-    }
-
-    /// Creates the connection pools for the Wikidata replica and the tool's own database.
-    fn prepare_pools(config: &Value) -> (Pool, Pool) {
-        let config_wikidata = config.get("wikidata").expect("Missing wikidata config");
-        let config_wdrc = config.get("wdrc").expect("Missing wdrc config");
+    /// Creates the connection pools for the Wikidata replica and the tool's own
+    /// database, and reports the size of the latter.
+    fn prepare_pools(config: &Value) -> Result<(Pool, Pool, usize)> {
+        let config_wikidata = config
+            .get("wikidata")
+            .ok_or_else(|| anyhow!("Missing 'wikidata' config"))?;
+        let config_wdrc = config
+            .get("wdrc")
+            .ok_or_else(|| anyhow!("Missing 'wdrc' config"))?;
         let my_cnf = Self::my_cnf_path(config);
         let wikidata_pool = Self::prepare_pool("wikidata", config_wikidata, || {
             Self::wikidata_url(config_wikidata, my_cnf.clone())
-        });
+        })?;
         let wdrc_pool = Self::prepare_pool("wdrc", config_wdrc, || {
             Self::wdrc_url(config_wdrc, my_cnf.as_deref())
-        });
-        (wikidata_pool, wdrc_pool)
+        })?;
+        Ok((wikidata_pool, wdrc_pool, Self::pool_max(config_wdrc)))
     }
 
     /// The credentials file to read the database user and password from.
@@ -689,12 +860,16 @@ impl WdRc {
     /// An explicit `url` in the config takes precedence, which is useful for local
     /// development through SSH tunnels. Otherwise the connection info is derived from
     /// `replica.my.cnf`, so no credentials are needed in the config file.
-    fn prepare_pool(name: &str, config: &Value, url: impl FnOnce() -> Result<String>) -> Pool {
+    fn prepare_pool(
+        name: &str,
+        config: &Value,
+        url: impl FnOnce() -> Result<String>,
+    ) -> Result<Pool> {
         let url = match config.get("url").and_then(|v| v.as_str()) {
             Some(url) => url.to_string(),
-            None => url().unwrap_or_else(|e| panic!("No {name} connection info: {e}")),
+            None => url().map_err(|e| anyhow!("No {name} connection info: {e}"))?,
         };
-        Pool::from_url(&url).unwrap_or_else(|e| panic!("Creating {name} pool failed: {e}"))
+        Pool::from_url(&url).map_err(|e| anyhow!("Creating {name} pool failed: {e}"))
     }
 
     pub async fn run_once(&mut self) -> Result<RunResult> {
@@ -703,34 +878,59 @@ impl WdRc {
     }
 
     async fn run_once_inner(&mut self) -> Result<RunResult> {
-        let future1 = self.update_recent_deletions();
-        let future2 = self.update_recent_redirects();
-        let (r1, r2) = join!(future1, future2);
-        if let Err(e) = r1 {
-            eprintln!("update_recent_deletions error: {e}");
+        let Some(available) = self.recentchanges_range().await? else {
+            return Ok(RunResult::CaughtUp);
+        };
+        // Deletions and redirects may have a backlog of their own to work off.
+        let mut more_work = self.update_aux_tables(&available).await;
+
+        let from = self.get_rc_cursor().await?;
+        let rc = self.get_recent_changes(&from).await?;
+        if let Some(cursor) = rc.cursor() {
+            self.log_recent_changes(&rc).await?;
+            self.log_new_items(&rc).await?;
+            // The cursor only moves once this batch is stored.
+            self.set_rc_cursor(cursor).await?;
+            // Keep going without sleeping while batches fill up, or while the
+            // cursor is still far behind the present.
+            more_work |= rc.row_count() >= self.max_recent_changes as usize
+                || Self::is_behind(&cursor.timestamp);
         }
-        if let Err(e) = r2 {
-            eprintln!("update_recent_redirects error: {e}");
-        }
-
-        let rc = self.get_recent_changes().await?;
-        let batch_full =
-            rc.changed_items().len() + rc.new_items().len() >= self.max_recent_changes as usize;
-
-        self.log_recent_changes(&rc).await?;
-        self.log_new_items(&rc).await?;
-
-        // self.purge_old_entries().await?;
-        Ok(if batch_full {
-            RunResult::MoreWork
-        } else {
-            RunResult::CaughtUp
+        Ok(match more_work {
+            true => RunResult::MoreWork,
+            false => RunResult::CaughtUp,
         })
     }
 
-    // pub async fn purge_old_entries(&self) -> Result<()> {
-    //     todo!()
-    // }
+    /// Refreshes the deletion and redirect tables, at most once per
+    /// `aux_interval` unless rows are still waiting, and returns whether they
+    /// are. Errors are reported but do not fail the run: recent changes are the
+    /// more time-critical part.
+    async fn update_aux_tables(&mut self, available: &ReplicaRange) -> bool {
+        if self
+            .last_aux_run
+            .is_some_and(|last| last.elapsed() < self.aux_interval)
+        {
+            return false;
+        }
+        let (deletions, redirects) = join!(
+            self.update_recent_deletions(),
+            self.update_recent_redirects(available)
+        );
+        for result in [&deletions, &redirects] {
+            if let Err(e) = result {
+                eprintln!("Auxiliary table update failed: {e}");
+            }
+        }
+        // Work off a backlog batch by batch; an error waits for the interval,
+        // so that a persistent failure is not retried in a tight loop.
+        let pending = |result: &Result<bool>| matches!(result, Ok(true));
+        let more_work = pending(&deletions) || pending(&redirects);
+        if !more_work {
+            self.last_aux_run = Some(Instant::now());
+        }
+        more_work
+    }
 }
 
 #[cfg(test)]
@@ -802,9 +1002,38 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires network access to www.wikidata.org"]
+    async fn test_changes_for_items() {
+        // Both items are covered by a single API request: an alias was added to
+        // Q42, and a statement was added to Q64, between the given revisions.
+        let items = [
+            ChangedItem::new_for_test("Q42", 2208025531, 2208025540, "20240101000000"),
+            ChangedItem::new_for_test("Q64", 2520718920, 2522551666, "20240102000000"),
+        ];
+        let refs: Vec<&ChangedItem> = items.iter().collect();
+        let api = WikidataApi::new(1).unwrap();
+        let changes = WdRc::changes_for_items(&api, &refs).await.unwrap();
+
+        let alias = changes
+            .iter()
+            .find(|c| c.subject == ChangeSubject::Aliases)
+            .expect("alias change");
+        assert_eq!((alias.item_id, alias.language.as_str()), (42, "ak"));
+        assert_eq!(alias.revision_id, 2208025540);
+        assert_eq!(alias.timestamp, "20240101000000");
+
+        let claim = changes
+            .iter()
+            .find(|c| c.subject == ChangeSubject::Claims)
+            .expect("claim change");
+        assert_eq!((claim.item_id, claim.property.as_str()), (64, "P14470"));
+        assert_eq!(claim.revision_id, 2522551666);
+    }
+
+    #[tokio::test]
     #[ignore = "requires a local config.json and live access to the wdrc database"]
     async fn test_get_or_create_text_id() {
-        let mut wdrc = WdRc::new("config.json");
+        let mut wdrc = WdRc::new("config.json").unwrap();
         let text = "aawikibooks";
         let id = wdrc.get_or_create_text_id(text).await.unwrap();
         assert_eq!(id, 1252);
@@ -816,6 +1045,97 @@ mod tests {
         assert!(WdRc::sanitize_timestamp("").is_ok()); // empty is technically valid
         assert!(WdRc::sanitize_timestamp("2023-12-31").is_err());
         assert!(WdRc::sanitize_timestamp("'; DROP TABLE--").is_err());
+    }
+
+    #[test]
+    fn test_chunked_statements() {
+        let rows: Vec<String> = (0..ROWS_PER_INSERT + 1).map(|i| format!("({i})")).collect();
+        let statements = WdRc::chunked_statements("INSERT INTO `t` (`a`)", &rows);
+        // One statement per ROWS_PER_INSERT rows, so no single statement can
+        // grow past the server's packet limit.
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].starts_with("INSERT INTO `t` (`a`) VALUES (0),(1),"));
+        assert_eq!(
+            statements[1],
+            format!("INSERT INTO `t` (`a`) VALUES ({})", ROWS_PER_INSERT)
+        );
+        assert!(WdRc::chunked_statements("INSERT INTO `t` (`a`)", &[]).is_empty());
+    }
+
+    #[test]
+    fn test_window_end() {
+        assert_eq!(WdRc::window_end("20240101120000"), "20240101130000");
+        // An unparsable cursor must not bound the query to the past.
+        assert_eq!(WdRc::window_end(""), NO_WINDOW_END);
+        assert_eq!(WdRc::window_end("not a timestamp"), NO_WINDOW_END);
+    }
+
+    #[test]
+    fn test_is_behind() {
+        assert!(WdRc::is_behind("20200101000000"));
+        assert!(!WdRc::is_behind(&TimeStamp::now()));
+        // A future or unparsable timestamp is not "behind".
+        assert!(!WdRc::is_behind(NO_WINDOW_END));
+    }
+
+    /// Changes of every subject, for the SQL builders below.
+    fn all_subject_changes() -> Vec<Change> {
+        vec![
+            Change {
+                subject: ChangeSubject::Claims,
+                property: "P31".to_string(),
+                item_id: 1,
+                revision_id: 10,
+                timestamp: "20240101000000".to_string(),
+                ..Default::default()
+            },
+            Change {
+                subject: ChangeSubject::Labels,
+                language: "en".to_string(),
+                item_id: 2,
+                revision_id: 20,
+                timestamp: "20240101000000".to_string(),
+                ..Default::default()
+            },
+            Change {
+                subject: ChangeSubject::Sitelinks,
+                site: "enwiki".to_string(),
+                item_id: 3,
+                revision_id: 30,
+                timestamp: "20240101000000".to_string(),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn test_build_statement_inserts() {
+        let statements = WdRc::build_statement_inserts(&all_subject_changes());
+        assert_eq!(statements.len(), 1);
+        assert!(statements[0].contains("INTO `statements`"));
+        // Only the claim change, and its property is stored numerically.
+        assert!(statements[0].ends_with("VALUES (1,10,31,'20240101000000','changed')"));
+    }
+
+    #[test]
+    fn test_build_label_inserts() {
+        let changes = all_subject_changes();
+        let text_cache: HashMap<String, TextId> =
+            [("en".to_string(), 7), ("enwiki".to_string(), 8)].into();
+        let statements = WdRc::build_label_inserts(&changes, &text_cache);
+        assert_eq!(statements.len(), 1);
+        assert!(statements[0].contains("INTO `labels`"));
+        // Labels and sitelinks share the table; the claim change is not in it.
+        assert!(statements[0].contains("(2,20,'labels','20240101000000','changed',7)"));
+        assert!(statements[0].contains("(3,30,'sitelinks','20240101000000','changed',8)"));
+        assert!(!statements[0].contains("(1,10"));
+    }
+
+    #[test]
+    fn test_build_label_inserts_skips_unknown_texts() {
+        // Without a `texts` id there is nothing to reference, so the row is dropped.
+        let statements = WdRc::build_label_inserts(&all_subject_changes(), &HashMap::new());
+        assert!(statements.is_empty());
     }
 
     #[test]
@@ -836,3 +1156,4 @@ mod tests {
         assert_eq!(WdRc::make_id_numeric("P123").unwrap(), 123);
     }
 }
+

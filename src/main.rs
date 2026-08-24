@@ -2,37 +2,39 @@ mod change;
 mod recent_changes;
 mod revision_compare;
 mod wdrc;
+mod wikidata_api;
 
+use anyhow::{anyhow, Result};
 use std::env;
 use wdrc::*;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
+    let command = args
+        .get(1)
+        .ok_or_else(|| anyhow!("Usage: wdrc_rs <bot|run> [config.json]"))?;
+    let config_file = args.get(2).map(|s| s.as_str()).unwrap_or("config.json");
+    let mut wdrc = WdRc::new(config_file)?;
 
-    let command = args.get(1).expect("command required");
-
-    let config_file = args
-        .get(2)
-        .map(|s| s.to_string())
-        .unwrap_or("config.json".to_string());
-    let mut wdrc = WdRc::new(&config_file);
-
-    if command == "bot" {
-        let sleep_duration = wdrc.bot_sleep();
-        loop {
-            match wdrc.run_once().await {
-                Ok(RunResult::MoreWork) => continue,
-                Ok(RunResult::CaughtUp) => (),
-                Err(e) => eprintln!("Error: {}", e),
+    match command.as_str() {
+        "bot" => {
+            let sleep_duration = wdrc.bot_sleep();
+            loop {
+                match wdrc.run_once().await {
+                    // More work waiting: start the next batch immediately.
+                    Ok(RunResult::MoreWork) => continue,
+                    Ok(RunResult::CaughtUp) => (),
+                    Err(e) => eprintln!("Error: {e}"),
+                }
+                tokio::time::sleep(sleep_duration).await;
             }
-            tokio::time::sleep(sleep_duration).await;
         }
-    } else if command == "run" {
-        match wdrc.run_once().await {
-            Ok(_) => (),
-            Err(e) => eprintln!("Error: {}", e),
+        "run" => {
+            wdrc.run_once().await?;
+            Ok(())
         }
+        other => Err(anyhow!("Unknown command {other:?}, expected 'bot' or 'run'")),
     }
 }
 

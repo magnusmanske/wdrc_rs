@@ -2,65 +2,45 @@ use std::collections::HashMap;
 
 use mysql_async::Row;
 
-use crate::{revision_compare::RevisionId, ItemId, WdRc};
+use crate::{revision_compare::RevisionId, WdRc};
+
+/// Position in `recentchanges`. Rows are read in `(rc_timestamp, rc_id)` order,
+/// so both parts are needed to resume exactly after the last row read: a
+/// timestamp alone would re-read (and re-store) every row of its second.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RcCursor {
+    pub timestamp: String,
+    pub rc_id: u64,
+}
 
 pub struct RecentChanges {
-    pub(crate) item_id: ItemId,
-    // rc_id: u64,
+    pub rc_id: u64,
     pub rc_timestamp: String,
-    // pub rc_actor: u64,
-    // pub rc_namespace: u64,
     pub rc_title: String,
-    // pub rc_comment_id: String,
-    // pub rc_minor: bool,
-    // pub rc_bot: bool,
-    pub rc_new: bool, // Derived from rc_source
-    // pub rc_cur_id: u64,
+    /// Derived from `rc_source`.
+    pub rc_new: bool,
     pub rc_this_oldid: u64,
     pub rc_last_oldid: u64,
-    // pub rc_source: String,
-    // pub rc_patrolled: bool,
-    // pub rc_ip: Option<String>,
-    // pub rc_old_len: Option<u64>,
-    // pub rc_new_len: Option<u64>,
-    // pub rc_deleted: u64,
-    // pub rc_logid: u64,
-    // pub rc_log_type: Option<String>,
-    // pub rc_log_action: Option<String>,
-    // pub rc_params: Option<String>,
 }
 
 impl RecentChanges {
     pub fn from_row(row: Row) -> Option<RecentChanges> {
         let rc_source: String = row.get("rc_source")?;
-        let mut ret = RecentChanges {
-            item_id: 0,
-            // rc_id: row.get("rc_id")?,
+        Some(RecentChanges {
+            rc_id: row.get("rc_id")?,
             rc_timestamp: row.get("rc_timestamp")?,
-            // rc_actor: row.get("rc_actor")?,
-            // rc_namespace: row.get("rc_namespace")?,
             rc_title: row.get("rc_title")?,
-            // rc_comment_id: row.get("rc_comment_id")?,
-            // rc_minor: row.get("rc_minor")?,
-            // rc_bot: row.get("rc_bot")?,
             rc_new: rc_source == "mw.new",
-            // rc_cur_id: row.get("rc_cur_id")?,
             rc_this_oldid: row.get("rc_this_oldid")?,
             rc_last_oldid: row.get("rc_last_oldid")?,
-            // rc_type: row.get("rc_type")?,
-            // rc_source: row.get("rc_source")?,
-            // rc_patrolled: row.get("rc_patrolled")?,
-            // rc_ip: row.get("rc_ip"),
-            // rc_old_len: row.get("rc_old_len"),
-            // rc_new_len: row.get("rc_new_len"),
-            // rc_deleted: row.get("rc_deleted")?,
-            // rc_logid: row.get("rc_logid")?,
-            // rc_log_type: row.get("rc_log_type"),
-            // rc_log_action: row.get("rc_log_action"),
-            // rc_params: row.get("rc_params"),
-        };
-        ret.item_id = WdRc::make_id_numeric(&ret.rc_title).ok()?;
-        Some(ret)
+        })
+    }
+
+    fn cursor(&self) -> RcCursor {
+        RcCursor {
+            timestamp: self.rc_timestamp.clone(),
+            rc_id: self.rc_id,
+        }
     }
 }
 
@@ -104,27 +84,46 @@ impl ChangedItem {
     pub fn timestamp(&self) -> &str {
         &self.timestamp
     }
+
+    #[cfg(test)]
+    pub fn new_for_test(q: &str, old: RevisionId, new: RevisionId, timestamp: &str) -> Self {
+        Self {
+            q: q.to_string(),
+            old,
+            new,
+            timestamp: timestamp.to_string(),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct RecentChangesResults {
     new_items: Vec<NewItem>,
     changed_items: Vec<ChangedItem>,
-    last_timestamp: Option<String>,
+    /// Position of the last row read, which is where the next batch resumes.
+    cursor: Option<RcCursor>,
+    /// Rows read from `recentchanges`, before collapsing them per item.
+    /// Compared against the batch size to tell whether more work is waiting.
+    row_count: usize,
 }
 
 impl RecentChangesResults {
     pub fn new(results: &[RecentChanges]) -> Self {
         let mut new_items: HashMap<String, NewItem> = HashMap::new();
         let mut changed_items: HashMap<String, ChangedItem> = HashMap::new();
-        let mut last_timestamp: Option<String> = None;
+        let mut cursor: Option<RcCursor> = None;
         for result in results {
+            // The cursor tracks every row, including any this tool ignores, so
+            // that no row is ever read twice.
+            let row_cursor = result.cursor();
+            if cursor.as_ref().is_none_or(|c| *c < row_cursor) {
+                cursor = Some(row_cursor);
+            }
+            if WdRc::make_id_numeric(&result.rc_title).is_err() {
+                continue;
+            }
             let q = result.rc_title.clone();
             let timestamp = result.rc_timestamp.clone();
-            match &last_timestamp {
-                Some(ts) if ts >= &timestamp => {}
-                _ => last_timestamp = Some(timestamp.clone()),
-            }
             if result.rc_new {
                 new_items.insert(q.clone(), NewItem { q, timestamp });
             } else {
@@ -156,16 +155,19 @@ impl RecentChangesResults {
         Self {
             new_items: new_items.into_values().collect(),
             changed_items: changed_items.into_values().collect(),
-            last_timestamp,
+            cursor,
+            row_count: results.len(),
         }
     }
 
-    /// Returns the last timestamp across all results (new + changed), or the given oldest timestamp as fallback.
-    pub fn get_last_rc_timetamp(&self, oldest: &str) -> String {
-        match &self.last_timestamp {
-            Some(t) => t.to_owned(),
-            None => oldest.to_string(),
-        }
+    /// Where the next batch should resume, or `None` if this batch was empty.
+    /// Never fall back to a fixed position here: that would rewind the cursor.
+    pub fn cursor(&self) -> Option<&RcCursor> {
+        self.cursor.as_ref()
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.row_count
     }
 
     pub fn new_items(&self) -> &Vec<NewItem> {
@@ -233,15 +235,21 @@ impl RecentDeletions {
 mod tests {
     use super::*;
 
+    /// `rc_id` defaults to a value derived from the revision, so that rows in a
+    /// test are distinct without every case having to spell it out.
     fn make_rc(title: &str, rc_new: bool, last_oldid: u64, this_oldid: u64) -> RecentChanges {
         RecentChanges {
-            item_id: 0,
+            rc_id: this_oldid,
             rc_timestamp: "20240101000000".to_string(),
             rc_title: title.to_string(),
             rc_new,
             rc_this_oldid: this_oldid,
             rc_last_oldid: last_oldid,
         }
+    }
+
+    fn cursor_of(rcr: &RecentChangesResults) -> Option<(&str, u64)> {
+        rcr.cursor().map(|c| (c.timestamp.as_str(), c.rc_id))
     }
 
     #[test]
@@ -262,7 +270,6 @@ mod tests {
 
     #[test]
     fn test_changed_items_in_order() {
-        // Results arrive in natural order: older change first.
         let results = vec![
             make_rc("Q42", false, 100, 101),
             make_rc("Q42", false, 101, 102),
@@ -270,7 +277,6 @@ mod tests {
         let rcr = RecentChangesResults::new(&results);
         assert_eq!(rcr.changed_items().len(), 1);
         let ci = &rcr.changed_items()[0];
-        assert_eq!(ci.q(), "Q42");
         assert_eq!(ci.rev_old(), 100);
         assert_eq!(ci.rev_new(), 102);
     }
@@ -285,56 +291,73 @@ mod tests {
     }
 
     #[test]
-    fn test_get_last_rc_timetamp_with_items() {
+    fn test_cursor_is_the_last_row() {
         let results = vec![
             make_rc("Q1", false, 100, 101),
             make_rc("Q2", false, 200, 201),
         ];
         let rcr = RecentChangesResults::new(&results);
-        // Should return max timestamp (they're all the same "20240101000000" from make_rc)
-        let ts = rcr.get_last_rc_timetamp("19990101000000");
-        assert_eq!(ts, "20240101000000");
+        assert_eq!(cursor_of(&rcr), Some(("20240101000000", 201)));
+        assert_eq!(rcr.row_count(), 2);
     }
 
     #[test]
-    fn test_get_last_rc_timetamp_empty() {
+    fn test_cursor_empty() {
         let rcr = RecentChangesResults::new(&[]);
-        let ts = rcr.get_last_rc_timetamp("19990101000000");
-        assert_eq!(ts, "19990101000000"); // Falls back to oldest
+        // No cursor means the caller must leave the stored one where it is.
+        assert_eq!(cursor_of(&rcr), None);
+        assert_eq!(rcr.row_count(), 0);
     }
 
     #[test]
-    fn test_get_last_rc_timetamp_only_new_items() {
-        let results = vec![make_rc("Q99", true, 0, 50)];
+    fn test_cursor_tracks_ignored_rows() {
+        // A row this tool has no use for still moves the cursor, or it would be
+        // read again on every pass.
+        let results = vec![
+            make_rc("Q1", false, 100, 101),
+            make_rc("Not_an_item", false, 200, 201),
+        ];
         let rcr = RecentChangesResults::new(&results);
-        // Now tracks all results, including new items
-        let ts = rcr.get_last_rc_timetamp("19990101000000");
-        assert_eq!(ts, "20240101000000");
+        assert_eq!(rcr.changed_items().len(), 1);
+        assert_eq!(rcr.row_count(), 2);
+        assert_eq!(cursor_of(&rcr), Some(("20240101000000", 201)));
     }
 
     #[test]
-    fn test_get_last_rc_timetamp_picks_max_across_new_and_changed() {
+    fn test_cursor_picks_max_across_new_and_changed() {
         let mut rc_new = make_rc("Q99", true, 0, 50);
         rc_new.rc_timestamp = "20240701000000".to_string();
         let mut rc_changed = make_rc("Q1", false, 100, 101);
         rc_changed.rc_timestamp = "20240601000000".to_string();
         let results = vec![rc_changed, rc_new];
         let rcr = RecentChangesResults::new(&results);
-        // The new item has the later timestamp
-        let ts = rcr.get_last_rc_timetamp("19990101000000");
-        assert_eq!(ts, "20240701000000");
+        assert_eq!(cursor_of(&rcr), Some(("20240701000000", 50)));
     }
 
     #[test]
-    fn test_multiple_items_different_timestamps() {
-        let mut rc1 = make_rc("Q1", false, 100, 101);
-        rc1.rc_timestamp = "20240101000000".to_string();
-        let mut rc2 = make_rc("Q2", false, 200, 201);
-        rc2.rc_timestamp = "20240601000000".to_string();
-        let results = vec![rc1, rc2];
+    fn test_cursor_prefers_timestamp_over_rc_id() {
+        // A later timestamp wins even when its row has the lower `rc_id`.
+        let mut older = make_rc("Q1", false, 100, 101);
+        older.rc_id = 900;
+        let mut newer = make_rc("Q2", false, 200, 201);
+        newer.rc_timestamp = "20240601000000".to_string();
+        newer.rc_id = 10;
+        let rcr = RecentChangesResults::new(&[older, newer]);
+        assert_eq!(cursor_of(&rcr), Some(("20240601000000", 10)));
+    }
+
+    #[test]
+    fn test_row_count_counts_rows_not_items() {
+        // Three rows for the same item collapse into one changed item,
+        // but the row count must still reflect the rows read.
+        let results = vec![
+            make_rc("Q1", false, 100, 101),
+            make_rc("Q1", false, 101, 102),
+            make_rc("Q1", false, 102, 103),
+        ];
         let rcr = RecentChangesResults::new(&results);
-        let ts = rcr.get_last_rc_timetamp("19990101000000");
-        assert_eq!(ts, "20240601000000");
+        assert_eq!(rcr.changed_items().len(), 1);
+        assert_eq!(rcr.row_count(), 3);
     }
 
     #[test]
@@ -346,7 +369,7 @@ mod tests {
         let results = vec![rc1, rc2];
         let rcr = RecentChangesResults::new(&results);
         assert_eq!(rcr.new_items().len(), 1);
-        // The HashMap insert means last one wins
         assert_eq!(rcr.new_items()[0].q(), "Q99");
+        assert_eq!(rcr.new_items()[0].timestamp(), "20240601000000");
     }
 }

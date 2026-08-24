@@ -8,5 +8,12 @@
 		"database": "s55078__wdrc_p",
 		"max_connections": 8
 	},
-	"max_recent_changes": 500
+	"//": "Optional, defaults in src/wdrc.rs:",
+	"//max_recent_changes": "recentchanges rows per batch (5000)",
+	"//max_api_concurrent": "concurrent API requests, 25 items each (8)",
+	"//aux_interval_sec": "between deletion/redirect refreshes (300)",
+	"//bot_sleep_sec": "between passes once caught up (10)",
+	"//db_timeout_sec": "per query (300)",
+	"//run_timeout_sec": "per pass (600)",
+	"//logging": "print per-batch progress (false)"
 }
