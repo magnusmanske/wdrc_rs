@@ -1,14 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde_json::{Map, Value};
-use std::{
-    collections::{BTreeSet, HashMap},
-    sync::Arc,
-    time::Duration,
-};
-use wikimisc::wikidata::Wikidata;
-
-/// Timeout for a single Wikidata API revision fetch.
-const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+use std::collections::{BTreeSet, HashMap};
 
 use crate::{
     change::{Change, ChangeSubject, ChangeType},
@@ -18,88 +10,22 @@ use crate::{
 
 pub type RevisionId = u64;
 
+/// Compares two revisions of one item and reports the differences.
+/// Purely computational: revision content is fetched by `WikidataApi`.
 pub struct RevisionCompare {
-    wd: Arc<Wikidata>,
     item_id: ItemId,
     revision_id: RevisionId,
     timestamp: String,
 }
 
 impl RevisionCompare {
-    pub fn new(wd: Arc<Wikidata>) -> RevisionCompare {
-        RevisionCompare {
-            wd,
-            item_id: 0,
-            revision_id: 0,
-            timestamp: "".to_string(),
-        }
-    }
-
-    pub async fn run(&mut self, ci: &ChangedItem) -> Result<Vec<Change>> {
-        self.item_id = WdRc::make_id_numeric(ci.q())?;
-        self.revision_id = ci.rev_new();
-        self.timestamp = ci.timestamp().to_string();
-
-        let revisions = self
-            .get_revisions_for_item(ci.q(), ci.rev_old(), ci.rev_new())
-            .await?;
-        let rev_old = revisions
-            .get(&ci.rev_old())
-            .ok_or_else(|| anyhow!("Could not load {} old revision {}", ci.q(), ci.rev_old()))?;
-        let rev_new = revisions
-            .get(&ci.rev_new())
-            .ok_or_else(|| anyhow!("Could not load {} new revision {}", ci.q(), ci.rev_new()))?;
-        let ret = self.compare_revisions(rev_old, rev_new);
-        Ok(ret)
-    }
-
-    fn get_revisions_url(q: &str, rev_id_old: RevisionId, rev_id_new: RevisionId) -> String {
-        format!("https://www.wikidata.org/w/api.php?action=query&prop=revisions&titles={q}&rvprop=ids|content&rvstartid={rev_id_new}&rvendid={rev_id_old}&rvslots=main&format=json")
-    }
-
-    fn extract_revisions(
-        rev_id_old: RevisionId,
-        rev_id_new: RevisionId,
-        j: &Value,
-    ) -> HashMap<RevisionId, Value> {
-        let mut ret = HashMap::new();
-        let pages = match j.get("query") {
-            Some(pages) => pages,
-            None => return ret,
-        };
-        let pages = Self::json_object(pages, "pages");
-        for page in pages.values() {
-            for revision in Self::json_array(page, "revisions").iter() {
-                if let Some(rev_id) = revision["revid"].as_u64() {
-                    if rev_id == rev_id_old || rev_id == rev_id_new {
-                        if let Some(text) = revision["slots"]["main"]["*"].as_str() {
-                            if let Ok(j) = serde_json::from_str::<Value>(text) {
-                                ret.insert(rev_id, j);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        ret
-    }
-
-    async fn get_revisions_for_item(
-        &self,
-        q: &str,
-        rev_id_old: RevisionId,
-        rev_id_new: RevisionId,
-    ) -> Result<HashMap<RevisionId, Value>> {
-        let url = Self::get_revisions_url(q, rev_id_old, rev_id_new);
-        let client = self.wd.reqwest_client()?;
-        let j: Value = tokio::time::timeout(API_REQUEST_TIMEOUT, async {
-            let resp = client.get(&url).send().await?;
-            resp.json().await.map_err(anyhow::Error::from)
+    /// Fails if the changed item does not carry a usable item ID.
+    pub fn new(ci: &ChangedItem) -> Result<Self> {
+        Ok(Self {
+            item_id: WdRc::make_id_numeric(ci.q())?,
+            revision_id: ci.rev_new(),
+            timestamp: ci.timestamp().to_string(),
         })
-        .await
-        .map_err(|_| anyhow!("API request timed out after {API_REQUEST_TIMEOUT:?} for {q}"))??;
-        let revisions = Self::extract_revisions(rev_id_old, rev_id_new, &j);
-        Ok(revisions)
     }
 
     fn create_label_change(
@@ -340,7 +266,7 @@ impl RevisionCompare {
         ret
     }
 
-    fn compare_revisions(&self, rev_old: &Value, rev_new: &Value) -> Vec<Change> {
+    pub fn compare_revisions(&self, rev_old: &Value, rev_new: &Value) -> Vec<Change> {
         let mut ret = vec![];
         ret.append(&mut self.compare_labels(rev_old, rev_new));
         ret.append(&mut self.compare_descriptions(rev_old, rev_new));
@@ -354,11 +280,6 @@ impl RevisionCompare {
         static EMPTY_MAP: std::sync::LazyLock<Map<String, Value>> =
             std::sync::LazyLock::new(Map::new);
         j.get(key).and_then(|v| v.as_object()).unwrap_or(&EMPTY_MAP)
-    }
-
-    fn json_array<'a>(j: &'a Value, key: &str) -> &'a Vec<Value> {
-        static EMPTY_VEC: std::sync::LazyLock<Vec<Value>> = std::sync::LazyLock::new(Vec::new);
-        j.get(key).and_then(|v| v.as_array()).unwrap_or(&EMPTY_VEC)
     }
 
     fn extract_aliases_from_map(aliases: &Map<String, Value>, language: &str) -> Vec<String> {
@@ -382,26 +303,14 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn test_get_revisions_for_item() {
-        let wd = Arc::new(Wikidata::new());
-        let wdrc = RevisionCompare::new(wd);
-        let q = "Q42";
-        let rev_id_old = 2208025531;
-        let rev_id_new = 2208025540;
-        let revisions = wdrc
-            .get_revisions_for_item(q, rev_id_old, rev_id_new)
-            .await
-            .unwrap();
-        assert_eq!(revisions.len(), 2);
-        assert_eq!(
-            revisions.get(&2208025531).unwrap()["id"].as_str().unwrap(),
-            "Q42"
-        );
-        assert_eq!(
-            revisions.get(&2208025540).unwrap()["id"].as_str().unwrap(),
-            "Q42"
-        );
+    /// A comparer with neutral item/revision/timestamp, so that the expected
+    /// `Change`s can be written as `Default`s.
+    fn comparer() -> RevisionCompare {
+        RevisionCompare {
+            item_id: 0,
+            revision_id: 0,
+            timestamp: String::new(),
+        }
     }
 
     #[test]
@@ -416,8 +325,7 @@ mod tests {
             "de": {"value": "alt"},
             "it": {"value":"nuovo"}}
         });
-        let wd = Arc::new(Wikidata::new());
-        let rc = RevisionCompare::new(wd);
+        let rc = comparer();
         let changes = rc.compare_labels(&old, &new);
         let expected = vec![
             Change {
@@ -460,8 +368,7 @@ mod tests {
             "de": {"value": "alt"},
             "it": {"value":"nuovo"}}
         });
-        let wd = Arc::new(Wikidata::new());
-        let rc = RevisionCompare::new(wd);
+        let rc = comparer();
         let changes = rc.compare_descriptions(&old, &new);
         let expected = vec![
             Change {
@@ -504,8 +411,7 @@ mod tests {
             "de": [{"value":"alt"}],
             "it": [{"value":"nuovo"}]}
         });
-        let wd = Arc::new(Wikidata::new());
-        let rc = RevisionCompare::new(wd);
+        let rc = comparer();
         let changes = rc.compare_aliases(&old, &new);
         let expected = vec![
             Change {
@@ -556,8 +462,7 @@ mod tests {
             "dewiki": {"title":"alt"},
             "itwiki": {"title":"nuovo"}}
         });
-        let wd = Arc::new(Wikidata::new());
-        let rc = RevisionCompare::new(wd);
+        let rc = comparer();
         let changes = rc.compare_sitelinks(&old, &new);
         let expected = vec![
             Change {
@@ -610,8 +515,7 @@ mod tests {
                 {"id": "Q1$128", "mainsnak": {"snaktype": "value", "datavalue": {"value": "new"}}},
             ],
         }});
-        let wd = Arc::new(Wikidata::new());
-        let rc = RevisionCompare::new(wd);
+        let rc = comparer();
         let mut changes = rc.compare_statements(&old, &new);
         changes.sort_by(|a, b| a.id.cmp(&b.id));
         let expected = vec![
@@ -700,106 +604,8 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_revisions_empty_response() {
-        let j = json!({});
-        let result = RevisionCompare::extract_revisions(100, 200, &j);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_extract_revisions_valid() {
-        let j = json!({
-            "query": {
-                "pages": {
-                    "123": {
-                        "revisions": [
-                            {
-                                "revid": 100,
-                                "slots": {
-                                    "main": {
-                                        "*": "{\"id\":\"Q42\",\"type\":\"item\"}"
-                                    }
-                                }
-                            },
-                            {
-                                "revid": 200,
-                                "slots": {
-                                    "main": {
-                                        "*": "{\"id\":\"Q42\",\"type\":\"item\",\"labels\":{\"en\":{\"value\":\"test\"}}}"
-                                    }
-                                }
-                            }
-                        ]
-                    }
-                }
-            }
-        });
-        let result = RevisionCompare::extract_revisions(100, 200, &j);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result.get(&100).unwrap()["id"].as_str().unwrap(), "Q42");
-        assert_eq!(result.get(&200).unwrap()["id"].as_str().unwrap(), "Q42");
-    }
-
-    #[test]
-    fn test_extract_revisions_ignores_unmatched_revids() {
-        let j = json!({
-            "query": {
-                "pages": {
-                    "123": {
-                        "revisions": [
-                            {
-                                "revid": 999,
-                                "slots": {
-                                    "main": {
-                                        "*": "{\"id\":\"Q42\"}"
-                                    }
-                                }
-                            }
-                        ]
-                    }
-                }
-            }
-        });
-        let result = RevisionCompare::extract_revisions(100, 200, &j);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_extract_revisions_invalid_json_in_slot() {
-        let j = json!({
-            "query": {
-                "pages": {
-                    "123": {
-                        "revisions": [
-                            {
-                                "revid": 100,
-                                "slots": {
-                                    "main": {
-                                        "*": "not valid json {"
-                                    }
-                                }
-                            }
-                        ]
-                    }
-                }
-            }
-        });
-        let result = RevisionCompare::extract_revisions(100, 200, &j);
-        assert!(result.is_empty()); // Invalid JSON should be skipped
-    }
-
-    #[test]
-    fn test_get_revisions_url() {
-        let url = RevisionCompare::get_revisions_url("Q42", 100, 200);
-        assert!(url.contains("Q42"));
-        assert!(url.contains("200")); // rvstartid
-        assert!(url.contains("100")); // rvendid
-    }
-
-    #[test]
     fn test_compare_revisions_empty() {
-        let wd = Arc::new(Wikidata::new());
-        let rc = RevisionCompare::new(wd);
+        let rc = comparer();
         let old = json!({});
         let new = json!({});
         let changes = rc.compare_revisions(&old, &new);

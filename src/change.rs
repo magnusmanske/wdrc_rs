@@ -57,6 +57,19 @@ pub struct Change {
 }
 
 impl Change {
+    /// The `texts` table key this change is recorded under: the site for
+    /// sitelinks, the language for labels/descriptions/aliases. Statements
+    /// go to their own table and have none.
+    pub fn text_key(&self) -> Option<&str> {
+        match self.subject {
+            ChangeSubject::Sitelinks => Some(&self.site),
+            ChangeSubject::Labels | ChangeSubject::Descriptions | ChangeSubject::Aliases => {
+                Some(&self.language)
+            }
+            ChangeSubject::Claims => None,
+        }
+    }
+
     pub fn get_statement_log(&self) -> Result<String> {
         let property = WdRc::make_id_numeric(&self.property)?;
         if !self.timestamp.chars().all(|c| c.is_ascii_digit()) {
@@ -141,6 +154,28 @@ mod tests {
             ..Default::default()
         };
         assert!(change.get_statement_log().is_err());
+    }
+
+    #[test]
+    fn test_text_key() {
+        let sitelink = Change {
+            subject: ChangeSubject::Sitelinks,
+            site: "enwiki".to_string(),
+            language: "en".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(sitelink.text_key(), Some("enwiki"));
+        let label = Change {
+            subject: ChangeSubject::Aliases,
+            language: "en".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(label.text_key(), Some("en"));
+        let claim = Change {
+            subject: ChangeSubject::Claims,
+            ..Default::default()
+        };
+        assert_eq!(claim.text_key(), None);
     }
 
     #[test]
