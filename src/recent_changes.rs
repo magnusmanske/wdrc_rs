@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use mysql_async::Row;
+use toolforge::pool::mysql_async::Row;
 
 use crate::{revision_compare::RevisionId, WdRc};
 

@@ -1,5 +1,6 @@
 {
 	"replica_my_cnf": "/data/project/wdrc/replica.my.cnf",
+	"//replica_my_cnf": "for local development, a copy with local='true' and a [tunnels] section with the ports of wikidatawiki and toolsdb, see the toolforge crate",
 	"wikidata": {
 		"database": "wikidatawiki",
 		"max_connections": 2

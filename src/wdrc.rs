@@ -9,8 +9,6 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use futures::{join, StreamExt};
-use ini::Ini;
-use mysql_async::{from_row, prelude::Queryable, Pool};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -19,7 +17,9 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-use toolforge::db::{get_db_connection_info, toolsdb, Cluster, DBConnectionInfo};
+use toolforge::db::{connection_info, connection_info_with_my_cnf, Cluster};
+use toolforge::pool::mysql_async::{from_row, prelude::Queryable, Conn};
+use toolforge::pool::{CustomPool, ToolsDbPool};
 use wikimisc::timestamp::TimeStamp;
 
 pub type TextId = u64;
@@ -38,15 +38,12 @@ pub enum RunResult {
 const WIKIDATA_DB: &str = "wikidatawiki";
 /// The tool's own database on toolsdb.
 const WDRC_DB: &str = "s55078__wdrc_p";
-/// The tool's credentials file. The `toolforge` crate looks for this in `$HOME`,
-/// which is not the tool's home directory in every execution context, so use the
-/// absolute path when it exists.
+/// The tool's credentials file, used when it exists. Otherwise the `toolforge`
+/// crate looks for credentials in the `TOOL_*` environment variables,
+/// `$TOOL_DATA_DIR` and `$HOME`.
 const REPLICA_MY_CNF: &str = "/data/project/wdrc/replica.my.cnf";
 /// Connection limit for a Toolforge tool account, and the `toolforge` crate default.
 const DEFAULT_POOL_MAX: usize = 10;
-/// Hosts serving the tool's own database, for regular and local (tunnelled) use.
-const TOOLSDB_HOST: &str = "tools.db.svc.wikimedia.cloud";
-const TOOLSDB_HOST_LOCAL: &str = "tools.db.svc.local.wmftest.net";
 
 /// `recentchanges` rows per batch. Each batch costs one cursor round trip, so
 /// larger batches catch up faster; the API requests within a batch are what
@@ -114,8 +111,9 @@ struct AuxBatch {
 pub struct WdRc {
     text_cache: HashMap<String, TextId>,
     api: WikidataApi,
-    wikidata_pool: Pool,
-    wdrc_pool: Pool,
+    wikidata_pool: CustomPool,
+    wdrc_pool: ToolsDbPool,
+    wdrc_db: String,
     wdrc_pool_max: usize,
     logging: bool,
     max_recent_changes: u64,
@@ -137,12 +135,13 @@ impl WdRc {
                 .unwrap_or(default)
         };
         let max_api_concurrent = config_u64("max_api_concurrent", MAX_API_CONCURRENT) as usize;
-        let (wikidata_pool, wdrc_pool, wdrc_pool_max) = Self::prepare_pools(&config)?;
+        let (wikidata_pool, wdrc_pool, wdrc_db, wdrc_pool_max) = Self::prepare_pools(&config)?;
         Ok(WdRc {
             text_cache: HashMap::new(),
             api: WikidataApi::new(max_api_concurrent)?,
             wikidata_pool,
             wdrc_pool,
+            wdrc_db,
             wdrc_pool_max,
             logging: config
                 .get("logging")
@@ -226,9 +225,9 @@ impl WdRc {
     async fn store_batch(&self, statements: &[String], cursor: &RcCursor) -> Result<()> {
         let timestamp = Self::sanitize_timestamp(&cursor.timestamp)?;
         let timeout = self.db_timeout;
-        let pool = &self.wdrc_pool;
         Self::with_timeout(timeout, "store_batch", async {
-            let mut tx = pool.start_transaction(Default::default()).await?;
+            let mut conn = self.wdrc_conn().await?;
+            let mut tx = conn.start_transaction(Default::default()).await?;
             for sql in statements {
                 tx.exec_drop(sql.as_str(), ()).await?;
             }
@@ -265,7 +264,6 @@ impl WdRc {
 			WHERE `rc_namespace`=0 AND `rc_timestamp`>=? AND `rc_timestamp`<=? AND (`rc_timestamp`>? OR `rc_id`>?)
 			ORDER BY `rc_timestamp`,`rc_id` LIMIT ?";
         let timeout = self.db_timeout;
-        let pool = &self.wikidata_pool;
         let params = (
             &from.timestamp,
             &window_end,
@@ -274,7 +272,7 @@ impl WdRc {
             self.max_recent_changes,
         );
         Self::with_timeout(timeout, "get_next_recent_changes_batch", async {
-            let mut conn = pool.get_conn().await?;
+            let mut conn = self.wikidata_conn().await?;
             let results: Vec<RecentChanges> = conn
                 .exec_iter(sql, params)
                 .await?
@@ -319,10 +317,9 @@ impl WdRc {
     /// as the connection pool allows. Returns the first error, if any.
     async fn exec_all(&self, label: &str, statements: &[String]) -> Result<()> {
         let timeout = self.db_timeout;
-        let pool = &self.wdrc_pool;
         let queries = statements.iter().map(|sql| {
             Self::with_timeout(timeout, label, async {
-                pool.get_conn().await?.exec_drop(sql.as_str(), ()).await?;
+                self.wdrc_conn().await?.exec_drop(sql.as_str(), ()).await?;
                 Ok(())
             })
         });
@@ -520,8 +517,7 @@ impl WdRc {
         let sql = "SELECT `rc_title` AS `source`,`rd_title` AS `target`,max(`rc_timestamp`) AS `timestamp` FROM `recentchanges`,`redirect`
 			WHERE `rc_namespace`=0 AND `rd_from`=`rc_cur_id` AND `rd_namespace`=0 AND `rc_timestamp`>=? AND `rc_timestamp`<=? GROUP BY `source`,`target` ORDER BY `timestamp` LIMIT ?";
         let results: Vec<RecentRedirects> = self
-            .wikidata_pool
-            .get_conn()
+            .wikidata_conn()
             .await?
             .exec_iter(sql, (oldest, window_end, AUX_QUERY_LIMIT))
             .await?
@@ -578,8 +574,7 @@ impl WdRc {
     async fn get_recent_deletions(&self, oldest: &str) -> Result<Vec<RecentDeletions>> {
         let sql = "SELECT `log_title` AS `q`,`log_timestamp` AS `timestamp` FROM `logging` WHERE `log_type`='delete' AND `log_action`='delete' AND `log_timestamp`>=? AND `log_namespace`=0 ORDER BY `log_timestamp` LIMIT ?";
         let results: Vec<RecentDeletions> = self
-            .wikidata_pool
-            .get_conn()
+            .wikidata_conn()
             .await?
             .exec_iter(sql, (oldest, AUX_QUERY_LIMIT))
             .await?
@@ -596,9 +591,8 @@ impl WdRc {
     async fn recentchanges_range(&self) -> Result<Option<ReplicaRange>> {
         let sql = "SELECT MIN(`rc_timestamp`),MAX(`rc_timestamp`) FROM `recentchanges`";
         let timeout = self.db_timeout;
-        let pool = &self.wikidata_pool;
         Self::with_timeout(timeout, "recentchanges_range", async {
-            let mut conn = pool.get_conn().await?;
+            let mut conn = self.wikidata_conn().await?;
             let rows: Vec<(Option<String>, Option<String>)> = conn
                 .exec_iter(sql, ())
                 .await?
@@ -689,9 +683,8 @@ impl WdRc {
     /// value in the meantime; in that case read the existing row.
     async fn insert_text(&self, text: &str) -> Result<TextId> {
         let timeout = self.db_timeout;
-        let pool = &self.wdrc_pool;
         Self::with_timeout(timeout, "insert_text", async {
-            let mut conn = pool.get_conn().await?;
+            let mut conn = self.wdrc_conn().await?;
             conn.exec_drop("INSERT IGNORE INTO `texts` (`value`) VALUES (?)", (text,))
                 .await
                 .map_err(|e| anyhow!("Error inserting text: {e}"))?;
@@ -719,10 +712,9 @@ impl WdRc {
         }
         let sql = "SELECT `value`,`id` FROM `texts`";
         let timeout = self.db_timeout;
-        let pool = &self.wdrc_pool;
         let result: Vec<(String, TextId)> =
             Self::with_timeout(timeout, "cache_texts_in_memory", async {
-                let mut conn = pool.get_conn().await?;
+                let mut conn = self.wdrc_conn().await?;
                 let result: Vec<(String, TextId)> = conn
                     .exec_iter(sql, ())
                     .await?
@@ -738,9 +730,8 @@ impl WdRc {
     async fn get_key_value(&self, key: &str) -> Result<Option<String>> {
         let sql = "SELECT value FROM `meta` WHERE `key`=?";
         let timeout = self.db_timeout;
-        let pool = &self.wdrc_pool;
         Self::with_timeout(timeout, &format!("get_key_value({key})"), async {
-            let mut conn = pool.get_conn().await?;
+            let mut conn = self.wdrc_conn().await?;
             let result: Vec<String> = conn
                 .exec_iter(sql, (key,))
                 .await?
@@ -754,9 +745,8 @@ impl WdRc {
     async fn set_key_value(&self, key: &str, value: &str) -> Result<()> {
         let sql = META_UPSERT_SQL;
         let timeout = self.db_timeout;
-        let pool = &self.wdrc_pool;
         Self::with_timeout(timeout, &format!("set_key_value({key})"), async {
-            let mut conn = pool.get_conn().await?;
+            let mut conn = self.wdrc_conn().await?;
             conn.exec_drop(sql, (key, value)).await?;
             Ok(())
         })
@@ -771,8 +761,8 @@ impl WdRc {
     }
 
     /// Creates the connection pools for the Wikidata replica and the tool's own
-    /// database, and reports the size of the latter.
-    fn prepare_pools(config: &Value) -> Result<(Pool, Pool, usize)> {
+    /// database, and reports the name and pool size of the latter.
+    fn prepare_pools(config: &Value) -> Result<(CustomPool, ToolsDbPool, String, usize)> {
         let config_wikidata = config
             .get("wikidata")
             .ok_or_else(|| anyhow!("Missing 'wikidata' config"))?;
@@ -780,17 +770,21 @@ impl WdRc {
             .get("wdrc")
             .ok_or_else(|| anyhow!("Missing 'wdrc' config"))?;
         let my_cnf = Self::my_cnf_path(config);
-        let wikidata_pool = Self::prepare_pool("wikidata", config_wikidata, || {
-            Self::wikidata_url(config_wikidata, my_cnf.clone())
-        })?;
-        let wdrc_pool = Self::prepare_pool("wdrc", config_wdrc, || {
-            Self::wdrc_url(config_wdrc, my_cnf.as_deref())
-        })?;
-        Ok((wikidata_pool, wdrc_pool, Self::pool_max(config_wdrc)))
+        let my_cnf_error = |e| Self::my_cnf_error(e, my_cnf.as_deref());
+        let wikidata_pool =
+            Self::wikidata_pool(config_wikidata, my_cnf.as_deref()).map_err(my_cnf_error)?;
+        let wdrc_pool = Self::wdrc_pool(config_wdrc, my_cnf.as_deref()).map_err(my_cnf_error)?;
+        let wdrc_db = Self::db_name(config_wdrc, WDRC_DB).to_string();
+        Ok((
+            wikidata_pool,
+            wdrc_pool,
+            wdrc_db,
+            Self::pool_max(config_wdrc),
+        ))
     }
 
     /// The credentials file to read the database user and password from.
-    /// `None` leaves the `toolforge` crate to look for `$HOME/replica.my.cnf`.
+    /// `None` leaves the `toolforge` crate to look for the credentials.
     fn my_cnf_path(config: &Value) -> Option<PathBuf> {
         if let Some(path) = config.get("replica_my_cnf").and_then(|v| v.as_str()) {
             return Some(PathBuf::from(path));
@@ -815,73 +809,43 @@ impl WdRc {
     }
 
     /// `toolforge` only names the file it could not find, so say where we looked.
-    fn my_cnf_error(error: impl std::fmt::Display, my_cnf: Option<&Path>) -> anyhow::Error {
+    fn my_cnf_error(error: toolforge::Error, my_cnf: Option<&Path>) -> anyhow::Error {
         match my_cnf {
             Some(my_cnf) => anyhow!("{error} (tried {})", my_cnf.display()),
             None => anyhow!(
-                "{error} (tried $HOME, as neither the 'replica_my_cnf' config key nor {REPLICA_MY_CNF} was usable)"
+                "{error} (tried the TOOL_* environment variables, $TOOL_DATA_DIR and $HOME, as neither the 'replica_my_cnf' config key nor {REPLICA_MY_CNF} was usable)"
             ),
         }
     }
 
-    fn wikidata_url(config: &Value, my_cnf: Option<PathBuf>) -> Result<String> {
+    fn wikidata_pool(config: &Value, my_cnf: Option<&Path>) -> toolforge::Result<CustomPool> {
         let db_name = Self::db_name(config, WIKIDATA_DB);
-        let info = get_db_connection_info(db_name, Cluster::WEB, my_cnf.clone())
-            .map_err(|e| Self::my_cnf_error(e, my_cnf.as_deref()))?;
-        Ok(info.pool_max(Self::pool_max(config)).to_string())
+        let info = match my_cnf {
+            Some(my_cnf) => connection_info_with_my_cnf(db_name, Cluster::Web, my_cnf),
+            None => connection_info(db_name, Cluster::Web),
+        }?;
+        CustomPool::builder(info.host, info.user, info.password)
+            .port(info.port)
+            .database(info.database)
+            .pool_max(Self::pool_max(config))
+            .build()
     }
 
-    fn wdrc_url(config: &Value, my_cnf: Option<&Path>) -> Result<String> {
-        let database = Self::db_name(config, WDRC_DB).to_string();
+    fn wdrc_pool(config: &Value, my_cnf: Option<&Path>) -> toolforge::Result<ToolsDbPool> {
+        let builder = ToolsDbPool::builder().pool_max(Self::pool_max(config));
         match my_cnf {
-            // `toolsdb()` always reads `$HOME/replica.my.cnf` and offers no way to
-            // point it elsewhere, so assemble the URL ourselves in that case.
-            Some(my_cnf) => Self::toolsdb_url(my_cnf, &database, Self::pool_max(config)),
-            None => {
-                let info: DBConnectionInfo =
-                    toolsdb(database).map_err(|e| Self::my_cnf_error(e, None))?;
-                Ok(info.pool_max(Self::pool_max(config)).to_string())
-            }
+            Some(my_cnf) => builder.my_cnf_path(my_cnf),
+            None => builder,
         }
+        .build()
     }
 
-    /// Equivalent of `toolforge::db::toolsdb()` for an explicitly located
-    /// `replica.my.cnf`. The query parameters follow the Toolforge connection
-    /// handling policy, as the `toolforge` crate does.
-    fn toolsdb_url(my_cnf: &Path, database: &str, pool_max: usize) -> Result<String> {
-        let ini = Ini::load_from_file(my_cnf)
-            .map_err(|e| anyhow!("Reading {} failed: {e}", my_cnf.display()))?;
-        let client = ini
-            .section(Some("client"))
-            .ok_or_else(|| anyhow!("No [client] section in {}", my_cnf.display()))?;
-        let value = |key: &str| {
-            client
-                .get(key)
-                .ok_or_else(|| anyhow!("No '{key}' in {}", my_cnf.display()))
-        };
-        let user = value("user")?;
-        let password = value("password")?;
-        let host = match client.get("local") {
-            Some(_) => TOOLSDB_HOST_LOCAL,
-            None => TOOLSDB_HOST,
-        };
-        Ok(format!("mysql://{user}:{password}@{host}:3306/{database}?pool_min=0&pool_max={pool_max}&inactive_connection_ttl=1&ttl_check_interval=30"))
+    async fn wikidata_conn(&self) -> Result<Conn> {
+        Ok(self.wikidata_pool.connect().await?)
     }
 
-    /// Creates a single connection pool.
-    /// An explicit `url` in the config takes precedence, which is useful for local
-    /// development through SSH tunnels. Otherwise the connection info is derived from
-    /// `replica.my.cnf`, so no credentials are needed in the config file.
-    fn prepare_pool(
-        name: &str,
-        config: &Value,
-        url: impl FnOnce() -> Result<String>,
-    ) -> Result<Pool> {
-        let url = match config.get("url").and_then(|v| v.as_str()) {
-            Some(url) => url.to_string(),
-            None => url().map_err(|e| anyhow!("No {name} connection info: {e}"))?,
-        };
-        Pool::from_url(&url).map_err(|e| anyhow!("Creating {name} pool failed: {e}"))
+    async fn wdrc_conn(&self) -> Result<Conn> {
+        Ok(self.wdrc_pool.connect(&self.wdrc_db).await?)
     }
 
     pub async fn run_once(&mut self) -> Result<RunResult> {
@@ -958,35 +922,51 @@ mod tests {
     }
 
     #[test]
-    fn test_toolsdb_url() {
+    fn test_pools() {
         let path = write_my_cnf(
-            "toolsdb_url",
+            "pools",
             "[client]\nuser='u12345'\npassword='correcthorsebatterystaple'\n",
         );
+        let config = json!({"max_connections": 8});
+        let wikidata = WdRc::wikidata_pool(&config, Some(&path)).unwrap();
         assert_eq!(
-            WdRc::toolsdb_url(&path, "s55078__wdrc_p", 8).unwrap(),
-            "mysql://u12345:correcthorsebatterystaple@tools.db.svc.wikimedia.cloud:3306/s55078__wdrc_p?pool_min=0&pool_max=8&inactive_connection_ttl=1&ttl_check_interval=30"
+            wikidata.server(),
+            "wikidatawiki.web.db.svc.wikimedia.cloud:3306"
         );
+        let wdrc = WdRc::wdrc_pool(&config, Some(&path)).unwrap();
+        assert_eq!(wdrc.server(), "tools.db.svc.wikimedia.cloud:3306");
     }
 
     #[test]
-    fn test_toolsdb_url_local() {
-        // `local` in the cnf means connections go through a local tunnel.
+    fn test_pools_local() {
+        // `local` in the cnf means connections go through local tunnels, on
+        // the ports in its `[tunnels]` section.
         let path = write_my_cnf(
-            "toolsdb_url_local",
-            "[client]\nuser='u12345'\npassword='pw'\nlocal='true'\n",
+            "pools_local",
+            "[client]\nuser='u12345'\npassword='pw'\nlocal='true'\n\n[tunnels]\nwikidatawiki = 3309\ntoolsdb = 3308\n",
         );
-        assert!(WdRc::toolsdb_url(&path, "db_p", 10)
-            .unwrap()
-            .contains("@tools.db.svc.local.wmftest.net:3306/db_p?"));
+        let config = json!({});
+        let wikidata = WdRc::wikidata_pool(&config, Some(&path)).unwrap();
+        assert_eq!(wikidata.server(), "127.0.0.1:3309");
+        let wdrc = WdRc::wdrc_pool(&config, Some(&path)).unwrap();
+        assert_eq!(wdrc.server(), "127.0.0.1:3308");
     }
 
     #[test]
-    fn test_toolsdb_url_errors() {
+    fn test_pool_errors() {
         // A missing file, and a file without the fields we need, must not panic.
-        assert!(WdRc::toolsdb_url(Path::new("/nonexistent/replica.my.cnf"), "db_p", 10).is_err());
-        let path = write_my_cnf("toolsdb_url_errors", "[client]\nuser='u12345'\n");
-        assert!(WdRc::toolsdb_url(&path, "db_p", 10).is_err());
+        let missing = Path::new("/nonexistent/replica.my.cnf");
+        assert!(WdRc::wikidata_pool(&json!({}), Some(missing)).is_err());
+        assert!(WdRc::wdrc_pool(&json!({}), Some(missing)).is_err());
+        let path = write_my_cnf("pool_errors", "[client]\nuser='u12345'\n");
+        assert!(WdRc::wdrc_pool(&json!({}), Some(&path)).is_err());
+        let error = WdRc::my_cnf_error(
+            WdRc::wdrc_pool(&json!({}), Some(missing)).unwrap_err(),
+            Some(missing),
+        );
+        assert!(error
+            .to_string()
+            .contains("(tried /nonexistent/replica.my.cnf)"));
     }
 
     #[test]
@@ -997,7 +977,7 @@ mod tests {
             Some(PathBuf::from("/tmp/somewhere/replica.my.cnf"))
         );
         // Without config, fall back to the tool's path only if it exists,
-        // otherwise let the `toolforge` crate look in `$HOME`.
+        // otherwise let the `toolforge` crate look for the credentials.
         assert_eq!(
             WdRc::my_cnf_path(&json!({})),
             Path::new(REPLICA_MY_CNF)
