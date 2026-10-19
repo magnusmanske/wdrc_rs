@@ -1,6 +1,7 @@
 mod change;
 mod recent_changes;
 mod revision_compare;
+mod telemetry;
 mod wdrc;
 mod wikidata_api;
 
@@ -19,13 +20,20 @@ async fn main() -> Result<()> {
 
     match command.as_str() {
         "bot" => {
+            telemetry::start();
             let sleep_duration = wdrc.bot_sleep();
             loop {
                 match wdrc.run_once().await {
                     // More work waiting: start the next batch immediately.
-                    Ok(RunResult::MoreWork) => continue,
-                    Ok(RunResult::CaughtUp) => (),
-                    Err(e) => eprintln!("Error: {e}"),
+                    Ok(RunResult::MoreWork) => {
+                        telemetry::record_run("more_work");
+                        continue;
+                    }
+                    Ok(RunResult::CaughtUp) => telemetry::record_run("caught_up"),
+                    Err(e) => {
+                        telemetry::record_run("error");
+                        eprintln!("Error: {e}");
+                    }
                 }
                 tokio::time::sleep(sleep_duration).await;
             }
@@ -34,7 +42,9 @@ async fn main() -> Result<()> {
             wdrc.run_once().await?;
             Ok(())
         }
-        other => Err(anyhow!("Unknown command {other:?}, expected 'bot' or 'run'")),
+        other => Err(anyhow!(
+            "Unknown command {other:?}, expected 'bot' or 'run'"
+        )),
     }
 }
 

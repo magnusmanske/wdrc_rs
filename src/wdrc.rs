@@ -128,12 +128,8 @@ pub struct WdRc {
 impl WdRc {
     pub fn new(config_file: &str) -> Result<WdRc> {
         let config = Self::read_config(config_file)?;
-        let config_u64 = |key: &str, default: u64| {
-            config
-                .get(key)
-                .and_then(|j| j.as_u64())
-                .unwrap_or(default)
-        };
+        let config_u64 =
+            |key: &str, default: u64| config.get(key).and_then(|j| j.as_u64()).unwrap_or(default);
         let max_api_concurrent = config_u64("max_api_concurrent", MAX_API_CONCURRENT) as usize;
         let (wikidata_pool, wdrc_pool, wdrc_db, wdrc_pool_max) = Self::prepare_pools(&config)?;
         Ok(WdRc {
@@ -151,7 +147,10 @@ impl WdRc {
             max_recent_changes: config_u64("max_recent_changes", MAX_RECENT_CHANGES),
             max_api_concurrent,
             db_timeout: Duration::from_secs(config_u64("db_timeout_sec", DEFAULT_DB_TIMEOUT_SEC)),
-            run_timeout: Duration::from_secs(config_u64("run_timeout_sec", DEFAULT_RUN_TIMEOUT_SEC)),
+            run_timeout: Duration::from_secs(config_u64(
+                "run_timeout_sec",
+                DEFAULT_RUN_TIMEOUT_SEC,
+            )),
             bot_sleep: Duration::from_secs(config_u64("bot_sleep_sec", DEFAULT_BOT_SLEEP_SEC)),
             aux_interval: Duration::from_secs(config_u64(
                 "aux_interval_sec",
@@ -347,9 +346,11 @@ impl WdRc {
         let mut statements =
             Self::chunked_statements("REPLACE INTO `creations` (`q`,`timestamp`)", &creations);
         // A recreated item is no longer deleted.
-        statements.extend(item_ids.chunks(ROWS_PER_INSERT).map(|chunk| {
-            format!("DELETE FROM `deletions` WHERE `q` IN ({})", chunk.join(","))
-        }));
+        statements.extend(
+            item_ids
+                .chunks(ROWS_PER_INSERT)
+                .map(|chunk| format!("DELETE FROM `deletions` WHERE `q` IN ({})", chunk.join(","))),
+        );
         statements
     }
 
@@ -676,6 +677,7 @@ impl WdRc {
         }
         let id = self.insert_text(text).await?;
         self.text_cache.insert(text.to_string(), id);
+        crate::telemetry::set_text_cache_entries(self.text_cache.len());
         Ok(id)
     }
 
@@ -724,6 +726,7 @@ impl WdRc {
             })
             .await?;
         self.text_cache = result.into_iter().collect();
+        crate::telemetry::set_text_cache_entries(self.text_cache.len());
         Ok(())
     }
 
@@ -754,8 +757,8 @@ impl WdRc {
     }
 
     fn read_config(config_file: &str) -> Result<Value> {
-        let file = File::open(config_file)
-            .map_err(|e| anyhow!("Reading {config_file} failed: {e}"))?;
+        let file =
+            File::open(config_file).map_err(|e| anyhow!("Reading {config_file} failed: {e}"))?;
         serde_json::from_reader(BufReader::new(file))
             .map_err(|e| anyhow!("Parsing {config_file} failed: {e}"))
     }
@@ -866,6 +869,7 @@ impl WdRc {
             let mut statements = self.change_statements(&rc).await?;
             statements.append(&mut Self::new_item_statements(&rc));
             self.store_batch(&statements, cursor).await?;
+            crate::telemetry::record_batch(rc.row_count(), statements.len(), &cursor.timestamp);
             // Keep going without sleeping while batches fill up, or while the
             // cursor is still far behind the present.
             more_work |= rc.row_count() >= self.max_recent_changes as usize
@@ -892,8 +896,9 @@ impl WdRc {
             self.update_recent_deletions(),
             self.update_recent_redirects(available)
         );
-        for result in [&deletions, &redirects] {
+        for (table, result) in [("deletions", &deletions), ("redirects", &redirects)] {
             if let Err(e) = result {
+                crate::telemetry::record_aux_failure(table);
                 eprintln!("Auxiliary table update failed: {e}");
             }
         }
@@ -1147,4 +1152,3 @@ mod tests {
         assert_eq!(WdRc::make_id_numeric("P123").unwrap(), 123);
     }
 }
-

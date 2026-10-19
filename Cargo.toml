@@ -14,8 +14,9 @@ futures = "0.3"
 # A single gzip-enabled client is reused for all API calls; see src/wikidata_api.rs
 reqwest = { version = "0.13", features = ["json", "gzip", "query"] }
 toolforge = { version = "6.1", features = ["wikipool"] }
-# Only `TimeStamp` is used; the API client lives in src/wikidata_api.rs.
-wikimisc = { version="*", features=["date"] }
+# `TimeStamp`, and `telemetry` for the Buggregator service dashboard (git only, not on
+# crates.io); the API client lives in src/wikidata_api.rs.
+wikimisc = { git = "https://github.com/magnusmanske/wikimisc", features = ["date", "telemetry"] }
 
 [profile.release]
 opt-level = 3
