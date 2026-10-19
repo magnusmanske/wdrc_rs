@@ -15,9 +15,7 @@ futures = "0.3"
 reqwest = { version = "0.13", features = ["json", "gzip", "query"] }
 toolforge = { version = "6.1", features = ["wikipool"] }
 # Only `TimeStamp` is used; the API client lives in src/wikidata_api.rs.
-wikimisc = { git = "https://github.com/magnusmanske/wikimisc.git", features = [
-    "date",
-] }
+wikimisc = { version="*", features=["date"] }
 
 [profile.release]
 opt-level = 3
