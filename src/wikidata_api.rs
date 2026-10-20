@@ -2,19 +2,15 @@ use crate::revision_compare::RevisionId;
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde_json::Value;
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
+use wikimisc::http;
 
 /// The API rejects more than this many revision IDs per request for
 /// anonymous clients (`apihighlimits` would raise it to 500).
 pub const MAX_REVIDS_PER_REQUEST: usize = 50;
 
 const API_URL: &str = "https://www.wikidata.org/w/api.php";
-const USER_AGENT: &str = concat!(
-    "wdrc_rs/",
-    env!("CARGO_PKG_VERSION"),
-    " (https://wdrc.toolforge.org/)"
-);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const USER_AGENT: &str = wikimisc::user_agent!("https://wdrc.toolforge.org/");
 
 /// Wikidata API client, cheap to clone.
 ///
@@ -34,11 +30,9 @@ impl WikidataApi {
     }
 
     fn with_url(api_url: &str, max_idle_per_host: usize) -> Result<Self> {
-        let client = Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(REQUEST_TIMEOUT)
-            // Entity JSON compresses roughly 6-fold, and this is the bulk of our traffic.
-            .gzip(true)
+        // 60 s timeout and gzip: entity JSON compresses roughly 6-fold, and
+        // this is the bulk of our traffic.
+        let client = http::client_builder(USER_AGENT)
             .pool_max_idle_per_host(max_idle_per_host)
             .build()?;
         Ok(Self {
@@ -142,6 +136,16 @@ mod tests {
         let error = json!({"error":{"code":"toomanyvalues","info":"..."}});
         assert!(WikidataApi::extract_revisions(&error).is_err());
         assert!(WikidataApi::extract_revisions(&json!({})).is_err());
+    }
+
+    #[test]
+    fn test_user_agent() {
+        let expected = concat!(
+            "wdrc_rs/",
+            env!("CARGO_PKG_VERSION"),
+            " (https://wdrc.toolforge.org/)"
+        );
+        assert_eq!(USER_AGENT, expected);
     }
 
     #[tokio::test]

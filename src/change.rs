@@ -1,5 +1,6 @@
-use crate::{revision_compare::RevisionId, ItemId, TextId, WdRc};
+use crate::{revision_compare::RevisionId, ItemId, TextId};
 use anyhow::Result;
+use wikimisc::entity_id::PropertyId;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub enum ChangeSubject {
@@ -71,7 +72,7 @@ impl Change {
     }
 
     pub fn get_statement_log(&self) -> Result<String> {
-        let property = WdRc::make_id_numeric(&self.property)?;
+        let property = self.property.parse::<PropertyId>()?.get();
         if !self.timestamp.chars().all(|c| c.is_ascii_digit()) {
             return Err(anyhow::anyhow!("Invalid timestamp: {:?}", self.timestamp));
         }
@@ -138,12 +139,14 @@ mod tests {
 
     #[test]
     fn test_get_statement_log_invalid_property() {
-        let change = Change {
-            property: "".to_string(),
-            timestamp: "20240101000000".to_string(),
-            ..Default::default()
-        };
-        assert!(change.get_statement_log().is_err());
+        for property in ["", "P", "P0", "Q31", "31"] {
+            let change = Change {
+                property: property.to_string(),
+                timestamp: "20240101000000".to_string(),
+                ..Default::default()
+            };
+            assert!(change.get_statement_log().is_err(), "{property:?}");
+        }
     }
 
     #[test]

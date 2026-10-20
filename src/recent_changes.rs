@@ -119,7 +119,7 @@ impl RecentChangesResults {
             if cursor.as_ref().is_none_or(|c| *c < row_cursor) {
                 cursor = Some(row_cursor);
             }
-            if WdRc::make_id_numeric(&result.rc_title).is_err() {
+            if WdRc::item_number(&result.rc_title).is_err() {
                 continue;
             }
             let q = result.rc_title.clone();

@@ -20,6 +20,8 @@ async fn main() -> Result<()> {
 
     match command.as_str() {
         "bot" => {
+            // To stderr, so that telemetry's status messages are not lost.
+            wikimisc::logging::init();
             telemetry::start();
             let sleep_duration = wdrc.bot_sleep();
             loop {

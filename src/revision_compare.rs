@@ -22,7 +22,7 @@ impl RevisionCompare {
     /// Fails if the changed item does not carry a usable item ID.
     pub fn new(ci: &ChangedItem) -> Result<Self> {
         Ok(Self {
-            item_id: WdRc::make_id_numeric(ci.q())?,
+            item_id: WdRc::item_number(ci.q())?,
             revision_id: ci.rev_new(),
             timestamp: ci.timestamp().to_string(),
         })

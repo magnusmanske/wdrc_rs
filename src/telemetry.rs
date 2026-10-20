@@ -3,20 +3,16 @@
 
 use std::time::Duration;
 use wikimisc::metrics::{counter, gauge};
-use wikimisc::telemetry::{Telemetry, TelemetryError};
+use wikimisc::telemetry::Telemetry;
 use wikimisc::timestamp::TimeStamp;
 
 /// Starts pushing to the dashboard (token from `$DASHBOARD_TOKEN`). Optional: without a token,
-/// or on any error, the bot just runs without it. On SIGTERM it sends a final push and exits.
+/// or on any error, the bot just runs without it; the outcome is logged. On SIGTERM it sends a
+/// final push and exits.
 pub fn start() {
-    match Telemetry::builder("bot")
+    Telemetry::builder("bot")
         .version(env!("CARGO_PKG_VERSION"))
-        .install()
-    {
-        Ok(_) => eprintln!("telemetry enabled"),
-        Err(e @ TelemetryError::NoToken) => eprintln!("telemetry disabled: {e}"),
-        Err(e) => eprintln!("telemetry disabled: {e}"),
-    }
+        .install_or_log();
 }
 
 /// How one `run_once` ended: `more_work`, `caught_up` or `error`.

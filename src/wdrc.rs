@@ -293,15 +293,9 @@ impl WdRc {
         }
     }
 
-    pub fn make_id_numeric(id: &str) -> Result<ItemId> {
-        if id.len() < 2 {
-            return Err(anyhow!("Bad ID: {id:?}"));
-        }
-        let q = id[1..].parse::<ItemId>()?;
-        if q == 0 {
-            return Err(anyhow!("Bad ID: {id:?}"));
-        }
-        Ok(q)
+    /// The number of an item ID in its canonical form, as in a page title (`Q42` → 42).
+    pub fn item_number(id: &str) -> Result<ItemId> {
+        Ok(id.parse::<wikimisc::entity_id::ItemId>()?.get())
     }
 
     /// Splits `rows` into statements of at most `ROWS_PER_INSERT` rows, so that a
@@ -335,7 +329,7 @@ impl WdRc {
         let mut item_ids = vec![];
         for new_item in rc.new_items() {
             let (Ok(q), Ok(ts)) = (
-                Self::make_id_numeric(new_item.q()),
+                Self::item_number(new_item.q()),
                 Self::sanitize_timestamp(new_item.timestamp()),
             ) else {
                 continue;
@@ -492,8 +486,8 @@ impl WdRc {
         let mut updates = vec![];
         for result in &results {
             let (Ok(source), Ok(target), Ok(ts)) = (
-                Self::make_id_numeric(result.source()),
-                Self::make_id_numeric(result.target()),
+                Self::item_number(result.source()),
+                Self::item_number(result.target()),
                 Self::sanitize_timestamp(result.timestamp()),
             ) else {
                 continue;
@@ -555,7 +549,7 @@ impl WdRc {
         let mut updates = vec![];
         for result in &results {
             let (Ok(q), Ok(ts)) = (
-                Self::make_id_numeric(result.q()),
+                Self::item_number(result.q()),
                 Self::sanitize_timestamp(result.timestamp()),
             ) else {
                 continue;
@@ -1135,20 +1129,12 @@ mod tests {
     }
 
     #[test]
-    fn test_make_id_numeric() {
-        // Empty string should return Err, not panic
-        assert!(WdRc::make_id_numeric("").is_err());
-
-        // Single char "Q" -> no numeric part, should return Err
-        assert!(WdRc::make_id_numeric("Q").is_err());
-
-        // "Q0" -> zero is explicitly rejected
-        assert!(WdRc::make_id_numeric("Q0").is_err());
-
-        // Valid Q-prefixed ID
-        assert_eq!(WdRc::make_id_numeric("Q42").unwrap(), 42);
-
-        // Valid P-prefixed ID
-        assert_eq!(WdRc::make_id_numeric("P123").unwrap(), 123);
+    fn test_item_number() {
+        assert_eq!(WdRc::item_number("Q42").unwrap(), 42);
+        // Not an item: no number, zero, another entity kind, a bare number
+        // (once misread as 2), a multibyte first character (once a panic).
+        for id in ["", "Q", "Q0", "P123", "42", "Ä42"] {
+            assert!(WdRc::item_number(id).is_err(), "{id:?}");
+        }
     }
 }

@@ -11,12 +11,13 @@ serde = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
-# A single gzip-enabled client is reused for all API calls; see src/wikidata_api.rs
+# A single gzip-enabled client (built by `wikimisc::http`) is reused for all API calls;
+# see src/wikidata_api.rs
 reqwest = { version = "0.13", features = ["json", "gzip", "query"] }
 toolforge = { version = "6.1", features = ["wikipool"] }
-# `TimeStamp`, and `telemetry` for the Buggregator service dashboard (git only, not on
-# crates.io); the API client lives in src/wikidata_api.rs.
-wikimisc = { git = "https://github.com/magnusmanske/wikimisc", features = ["date", "telemetry"] }
+# `TimeStamp`, entity IDs, the HTTP client setup, logging, and `telemetry` for the
+# Buggregator service dashboard (git only, not on crates.io).
+wikimisc = { git = "https://github.com/magnusmanske/wikimisc", features = ["date", "entity-id", "http", "logging", "telemetry"] }
 
 [profile.release]
 opt-level = 3
