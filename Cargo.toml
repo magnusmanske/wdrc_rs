@@ -7,7 +7,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-serde = "1"
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -15,9 +16,14 @@ futures = "0.3"
 # see src/wikidata_api.rs
 reqwest = { version = "0.13", features = ["json", "gzip", "query"] }
 toolforge = { version = "6.1", features = ["wikipool"] }
-# `TimeStamp`, entity IDs, the HTTP client setup, logging, and `telemetry` for the
-# Buggregator service dashboard (git only, not on crates.io).
-wikimisc = { git = "https://github.com/magnusmanske/wikimisc", features = ["date", "entity-id", "http", "logging", "telemetry"] }
+# `TimeStamp`, entity IDs, the HTTP client setup, logging, `telemetry` for the
+# Buggregator service dashboard, and for the web service: axum glue (`server`),
+# HTML escaping and the SPARQL client (git only, not on crates.io).
+wikimisc = { git = "https://github.com/magnusmanske/wikimisc", features = ["date", "entity-id", "escape", "http", "logging", "server", "sparql-client", "telemetry"] }
+
+[dev-dependencies]
+# Calls the axum router directly in the web service tests.
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 3

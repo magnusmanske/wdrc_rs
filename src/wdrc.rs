@@ -19,7 +19,7 @@ use std::{
 };
 use toolforge::db::{connection_info, connection_info_with_my_cnf, Cluster};
 use toolforge::pool::mysql_async::{from_row, prelude::Queryable, Conn};
-use toolforge::pool::{CustomPool, ToolsDbPool};
+use toolforge::pool::{CustomPool, ToolsDbPool, ToolsDbPoolBuilder};
 use wikimisc::timestamp::TimeStamp;
 
 pub type TextId = u64;
@@ -70,7 +70,7 @@ const AUX_QUERY_LIMIT: usize = 5000;
 /// that has no row yet, which would leave that cursor stuck at its fallback.
 const META_UPSERT_SQL: &str = "INSERT INTO `meta` (`key`,`value`) VALUES (?,?) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)";
 /// `meta` keys holding the processing cursors.
-const META_RC_TIMESTAMP: &str = "timestamp";
+pub(crate) const META_RC_TIMESTAMP: &str = "timestamp";
 const META_RC_ID: &str = "rc_id";
 const META_REDIRECT: &str = "timestamp_redirect";
 const META_DELETION: &str = "timestamp_deletion";
@@ -750,7 +750,7 @@ impl WdRc {
         .await
     }
 
-    fn read_config(config_file: &str) -> Result<Value> {
+    pub(crate) fn read_config(config_file: &str) -> Result<Value> {
         let file =
             File::open(config_file).map_err(|e| anyhow!("Reading {config_file} failed: {e}"))?;
         serde_json::from_reader(BufReader::new(file))
@@ -763,21 +763,32 @@ impl WdRc {
         let config_wikidata = config
             .get("wikidata")
             .ok_or_else(|| anyhow!("Missing 'wikidata' config"))?;
-        let config_wdrc = config
-            .get("wdrc")
-            .ok_or_else(|| anyhow!("Missing 'wdrc' config"))?;
         let my_cnf = Self::my_cnf_path(config);
-        let my_cnf_error = |e| Self::my_cnf_error(e, my_cnf.as_deref());
-        let wikidata_pool =
-            Self::wikidata_pool(config_wikidata, my_cnf.as_deref()).map_err(my_cnf_error)?;
-        let wdrc_pool = Self::wdrc_pool(config_wdrc, my_cnf.as_deref()).map_err(my_cnf_error)?;
-        let wdrc_db = Self::db_name(config_wdrc, WDRC_DB).to_string();
-        Ok((
-            wikidata_pool,
-            wdrc_pool,
-            wdrc_db,
-            Self::pool_max(config_wdrc),
-        ))
+        let wikidata_pool = Self::wikidata_pool(config_wikidata, my_cnf.as_deref())
+            .map_err(|e| Self::my_cnf_error(e, my_cnf.as_deref()))?;
+        let wdrc_pool_max = Self::pool_max(Self::wdrc_config(config)?);
+        let builder = ToolsDbPool::builder().pool_max(wdrc_pool_max);
+        let (wdrc_pool, wdrc_db) = Self::tool_db(config, builder)?;
+        Ok((wikidata_pool, wdrc_pool, wdrc_db, wdrc_pool_max))
+    }
+
+    /// The tool database: a pool built from `builder` with the configured
+    /// credentials, and the database name from the `wdrc` config section.
+    pub(crate) fn tool_db(
+        config: &Value,
+        builder: ToolsDbPoolBuilder,
+    ) -> Result<(ToolsDbPool, String)> {
+        let database = Self::db_name(Self::wdrc_config(config)?, WDRC_DB).to_string();
+        let my_cnf = Self::my_cnf_path(config);
+        let pool = Self::wdrc_pool(builder, my_cnf.as_deref())
+            .map_err(|e| Self::my_cnf_error(e, my_cnf.as_deref()))?;
+        Ok((pool, database))
+    }
+
+    fn wdrc_config(config: &Value) -> Result<&Value> {
+        config
+            .get("wdrc")
+            .ok_or_else(|| anyhow!("Missing 'wdrc' config"))
     }
 
     /// The credentials file to read the database user and password from.
@@ -828,8 +839,10 @@ impl WdRc {
             .build()
     }
 
-    fn wdrc_pool(config: &Value, my_cnf: Option<&Path>) -> toolforge::Result<ToolsDbPool> {
-        let builder = ToolsDbPool::builder().pool_max(Self::pool_max(config));
+    fn wdrc_pool(
+        builder: ToolsDbPoolBuilder,
+        my_cnf: Option<&Path>,
+    ) -> toolforge::Result<ToolsDbPool> {
         match my_cnf {
             Some(my_cnf) => builder.my_cnf_path(my_cnf),
             None => builder,
@@ -932,7 +945,7 @@ mod tests {
             wikidata.server(),
             "wikidatawiki.web.db.svc.wikimedia.cloud:3306"
         );
-        let wdrc = WdRc::wdrc_pool(&config, Some(&path)).unwrap();
+        let wdrc = WdRc::wdrc_pool(ToolsDbPool::builder(), Some(&path)).unwrap();
         assert_eq!(wdrc.server(), "tools.db.svc.wikimedia.cloud:3306");
     }
 
@@ -947,7 +960,7 @@ mod tests {
         let config = json!({});
         let wikidata = WdRc::wikidata_pool(&config, Some(&path)).unwrap();
         assert_eq!(wikidata.server(), "127.0.0.1:3309");
-        let wdrc = WdRc::wdrc_pool(&config, Some(&path)).unwrap();
+        let wdrc = WdRc::wdrc_pool(ToolsDbPool::builder(), Some(&path)).unwrap();
         assert_eq!(wdrc.server(), "127.0.0.1:3308");
     }
 
@@ -956,16 +969,33 @@ mod tests {
         // A missing file, and a file without the fields we need, must not panic.
         let missing = Path::new("/nonexistent/replica.my.cnf");
         assert!(WdRc::wikidata_pool(&json!({}), Some(missing)).is_err());
-        assert!(WdRc::wdrc_pool(&json!({}), Some(missing)).is_err());
+        assert!(WdRc::wdrc_pool(ToolsDbPool::builder(), Some(missing)).is_err());
         let path = write_my_cnf("pool_errors", "[client]\nuser='u12345'\n");
-        assert!(WdRc::wdrc_pool(&json!({}), Some(&path)).is_err());
+        assert!(WdRc::wdrc_pool(ToolsDbPool::builder(), Some(&path)).is_err());
         let error = WdRc::my_cnf_error(
-            WdRc::wdrc_pool(&json!({}), Some(missing)).unwrap_err(),
+            WdRc::wdrc_pool(ToolsDbPool::builder(), Some(missing)).unwrap_err(),
             Some(missing),
         );
         assert!(error
             .to_string()
             .contains("(tried /nonexistent/replica.my.cnf)"));
+    }
+
+    #[test]
+    fn test_tool_db() {
+        let path = write_my_cnf("tool_db", "[client]\nuser='u12345'\npassword='pw'\n");
+        let my_cnf = path.to_str().unwrap();
+        let config = json!({"replica_my_cnf": my_cnf, "wdrc": {"database": "s1__x_p"}});
+        let (pool, database) = WdRc::tool_db(&config, ToolsDbPool::builder()).unwrap();
+        assert_eq!(database, "s1__x_p");
+        assert_eq!(pool.server(), "tools.db.svc.wikimedia.cloud:3306");
+        let config = json!({"replica_my_cnf": my_cnf, "wdrc": {}});
+        assert_eq!(
+            WdRc::tool_db(&config, ToolsDbPool::builder()).unwrap().1,
+            WDRC_DB
+        );
+        let config = json!({"replica_my_cnf": my_cnf});
+        assert!(WdRc::tool_db(&config, ToolsDbPool::builder()).is_err());
     }
 
     #[test]

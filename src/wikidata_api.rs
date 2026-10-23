@@ -10,7 +10,7 @@ use wikimisc::http;
 pub const MAX_REVIDS_PER_REQUEST: usize = 50;
 
 const API_URL: &str = "https://www.wikidata.org/w/api.php";
-const USER_AGENT: &str = wikimisc::user_agent!("https://wdrc.toolforge.org/");
+pub(crate) const USER_AGENT: &str = wikimisc::user_agent!("https://wdrc.toolforge.org/");
 
 /// Wikidata API client, cheap to clone.
 ///

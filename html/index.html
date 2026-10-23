@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<title>Wikidata Recent Changes API</title>
+<link rel="stylesheet" href="https://tools-static.wmflabs.org/cdnjs/ajax/libs/twitter-bootstrap/4.0.0/css/bootstrap.min.css">
+<link rel="stylesheet" href="https://tools-static.wmflabs.org/magnustools/resources/html/wikimedia.css">
+<style>
+input[type="text"] {
+	width: 16rem;
+}
+</style>
+</head>
+
+<body>
+<div class='container'>
+	<div class='row'>
+		<h1>Wikidata Recent Changes API</h1>
+		<div class='lead'>
+			This API lets you query Wikidata edits by either properties, or labels/aliases/descriptions/sitelinks.
+			You can retrieve any changes, or specify added/changed/removed.
+			Current lag to Wikidata: <span id='lag'></span>.
+		</div>
+	</div>
+
+	<div class='row'>
+		<h2>Query by properties</h2>
+	</div>
+	<div class='row'>
+		<form target='_blank' action='./api.php' method='GET'>
+			<input type='hidden' name='action' value='properties' />
+			<table class='table'>
+				<tr>
+					<th>Properties</th>
+					<td>
+						<input type='text' name='properties' placeholder="P131,P12345,..." />
+						<span style='color:red' title='required'>*</span>
+					</td>
+				</tr>
+				<tr>
+					<th>Since</th>
+					<td>
+						<input type='text' name='since' placeholder="20220707095700" />
+						<span style='color:red' title='required'>*</span>
+						<small>(shorter allowed)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Type</th>
+					<td>
+						<input type='text' name='type' placeholder="added,changed,removed" />
+						<small>(default: all)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Format</th>
+					<td>
+						<label><input type='radio' name='format' value='html' /> HTML</label>
+						<label><input type='radio' name='format' value='json' /> JSON</label>
+						<label><input type='radio' name='format' value='jsonl' checked /> JSONL</label>
+						<small>(JSONL writes one JSON element per row, can return larger result sets)</small>
+					</td>
+				</tr>
+				<tr>
+					<td colspan='2'>
+						<input type='submit' class='btn btn-outline-primary' value='Run' />
+					</td>
+				</tr>
+			</table>
+		</form>
+	</div>
+
+	<div class='row'>
+		<h2>Query by text/sitelinks</h2>
+	</div>
+	<div class='row'>
+		<form target='_blank' action='./api.php' method='GET'>
+			<input type='hidden' name='action' value='text' />
+			<table class='table'>
+				<tr>
+					<th>Element</th>
+					<td>
+						<input type='text' name='element' placeholder="labels,aliases,descriptions,sitelinks" />
+						<small>(default: all)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Site/language</th>
+					<td>
+						<input type='text' name='text' placeholder="de,enwiki,..." />
+						<small>(default: all)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Since</th>
+					<td>
+						<input type='text' name='since' placeholder="20220707095700" />
+						<span style='color:red' title='required'>*</span>
+						<small>(shorter allowed)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Type</th>
+					<td>
+						<input type='text' name='type' placeholder="added,changed,removed" />
+						<small>(default: all)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Format</th>
+					<td>
+						<label><input type='radio' name='format' value='html' /> HTML</label>
+						<label><input type='radio' name='format' value='json' /> JSON</label>
+						<label><input type='radio' name='format' value='jsonl' checked /> JSONL</label>
+						<small>(JSONL writes one JSON element per row, can return larger result sets)</small>
+					</td>
+				</tr>
+				<tr>
+					<td colspan='2'>
+						<input type='submit' class='btn btn-outline-primary' value='Run' />
+					</td>
+				</tr>
+			</table>
+		</form>
+	</div>
+
+	<div class='row'>
+		<h2>Query by items</h2>
+	</div>
+	<div class='row'>
+		<form target='_blank' action='./api.php' method='POST'>
+			<input type='hidden' name='action' value='items' />
+			<table class='table'>
+				<tr>
+					<th>Items</th>
+					<td>
+						<textarea rows='5' name='items' placeholder='Item Qids separated by comma, semicolon, pipe, or newline' style='width:100%'></textarea>
+					</td>
+				</tr>
+				<tr>
+					<th>SPARQL</th>
+					<td>
+						<input type='text' name='sparql' placeholder='SPARQL query (if no items above); the first variable holds the items' style='width:100%' />
+					</td>
+				</tr>
+				<tr>
+					<th>Since</th>
+					<td>
+						<input type='text' name='since' placeholder="20220707095700" />
+						<span style='color:red' title='required'>*</span>
+						<small>(shorter allowed)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Format</th>
+					<td>
+						<label><input type='radio' name='format' value='html' /> HTML</label>
+						<label><input type='radio' name='format' value='json' /> JSON</label>
+						<label><input type='radio' name='format' value='jsonl' checked /> JSONL</label>
+						<small>(JSONL writes one JSON element per row, can return larger result sets)</small>
+					</td>
+				</tr>
+				<tr>
+					<td colspan='2'>
+						<input type='submit' class='btn btn-outline-primary' value='Run' />
+					</td>
+				</tr>
+			</table>
+		</form>
+	</div>
+
+	<div class='row'>
+		<h2>Redirects</h2>
+	</div>
+	<div class='row'>
+		<form target='_blank' action='./api.php' method='GET'>
+			<input type='hidden' name='action' value='redirects' />
+			<table class='table'>
+				<tr>
+					<th>Since</th>
+					<td>
+						<input type='text' name='since' placeholder="20230705000000" />
+						<span style='color:red' title='required'>*</span>
+						<small>(shorter allowed)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Until</th>
+					<td>
+						<input type='text' name='until' placeholder="20230706000000" />
+						<small>(shorter allowed)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Format</th>
+					<td>
+						<label><input type='radio' name='format' value='html' /> HTML</label>
+						<label><input type='radio' name='format' value='json' /> JSON</label>
+						<label><input type='radio' name='format' value='jsonl' checked /> JSONL</label>
+						<small>(JSONL writes one JSON element per row, can return larger result sets)</small>
+					</td>
+				</tr>
+				<tr>
+					<td colspan='2'>
+						<input type='submit' class='btn btn-outline-primary' value='Run' />
+					</td>
+				</tr>
+			</table>
+		</form>
+	</div>
+
+	<div class='row'>
+		<h2>Item creations</h2>
+	</div>
+	<div class='row'>
+		<form target='_blank' action='./api.php' method='GET'>
+			<input type='hidden' name='action' value='creations' />
+			<table class='table'>
+				<tr>
+					<th>Since</th>
+					<td>
+						<input type='text' name='since' placeholder="20230705000000" />
+						<span style='color:red' title='required'>*</span>
+						<small>(shorter allowed)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Until</th>
+					<td>
+						<input type='text' name='until' placeholder="20230706000000" />
+						<small>(shorter allowed)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Format</th>
+					<td>
+						<label><input type='radio' name='format' value='html' /> HTML</label>
+						<label><input type='radio' name='format' value='json' /> JSON</label>
+						<label><input type='radio' name='format' value='jsonl' checked /> JSONL</label>
+						<small>(JSONL writes one JSON element per row, can return larger result sets)</small>
+					</td>
+				</tr>
+				<tr>
+					<td colspan='2'>
+						<input type='submit' class='btn btn-outline-primary' value='Run' />
+					</td>
+				</tr>
+			</table>
+		</form>
+	</div>
+
+	<div class='row'>
+		<h2>Item deletions</h2>
+	</div>
+	<div class='row'>
+		<form target='_blank' action='./api.php' method='GET'>
+			<input type='hidden' name='action' value='deletions' />
+			<table class='table'>
+				<tr>
+					<th>Since</th>
+					<td>
+						<input type='text' name='since' placeholder="20230705000000" />
+						<span style='color:red' title='required'>*</span>
+						<small>(shorter allowed)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Until</th>
+					<td>
+						<input type='text' name='until' placeholder="20230706000000" />
+						<small>(shorter allowed)</small>
+					</td>
+				</tr>
+				<tr>
+					<th>Format</th>
+					<td>
+						<label><input type='radio' name='format' value='html' /> HTML</label>
+						<label><input type='radio' name='format' value='json' /> JSON</label>
+						<label><input type='radio' name='format' value='jsonl' checked /> JSONL</label>
+						<small>(JSONL writes one JSON element per row, can return larger result sets)</small>
+					</td>
+				</tr>
+				<tr>
+					<td colspan='2'>
+						<input type='submit' class='btn btn-outline-primary' value='Run' />
+					</td>
+				</tr>
+			</table>
+		</form>
+	</div>
+
+	<div class='row'>
+		<small><a href='https://github.com/magnusmanske/wdrc_rs' target='_blank'>github</a></small>
+	</div>
+</div>
+
+<script>
+'use strict';
+
+async function update_lag() {
+	try {
+		const response = await fetch('./api.php?action=lag&format=json');
+		const d = await response.json();
+		document.getElementById('lag').textContent = d.lag ?? d.status;
+	} catch (e) {
+		document.getElementById('lag').textContent = 'unknown';
+	}
+	setTimeout(update_lag, 60000); // 1 min
+}
+
+update_lag();
+</script>
+</body>
+</html>

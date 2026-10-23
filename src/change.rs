@@ -1,8 +1,9 @@
 use crate::{revision_compare::RevisionId, ItemId, TextId};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use std::str::FromStr;
 use wikimisc::entity_id::PropertyId;
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum ChangeSubject {
     #[default]
     Labels,
@@ -13,6 +14,14 @@ pub enum ChangeSubject {
 }
 
 impl ChangeSubject {
+    const ALL: [ChangeSubject; 5] = [
+        ChangeSubject::Labels,
+        ChangeSubject::Descriptions,
+        ChangeSubject::Sitelinks,
+        ChangeSubject::Aliases,
+        ChangeSubject::Claims,
+    ];
+
     pub fn as_str(&self) -> &str {
         match self {
             ChangeSubject::Labels => "labels",
@@ -24,7 +33,7 @@ impl ChangeSubject {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ChangeType {
     #[default]
     Changed,
@@ -32,13 +41,37 @@ pub enum ChangeType {
     Added,
 }
 
+impl FromStr for ChangeSubject {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|subject| subject.as_str() == s)
+            .ok_or_else(|| anyhow!("Unknown change subject {s:?}"))
+    }
+}
+
 impl ChangeType {
+    const ALL: [ChangeType; 3] = [ChangeType::Changed, ChangeType::Removed, ChangeType::Added];
+
     pub fn as_str(&self) -> &str {
         match self {
             ChangeType::Changed => "changed",
             ChangeType::Removed => "removed",
             ChangeType::Added => "added",
         }
+    }
+}
+
+impl FromStr for ChangeType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|change_type| change_type.as_str() == s)
+            .ok_or_else(|| anyhow!("Unknown change type {s:?}"))
     }
 }
 
@@ -74,7 +107,7 @@ impl Change {
     pub fn get_statement_log(&self) -> Result<String> {
         let property = self.property.parse::<PropertyId>()?.get();
         if !self.timestamp.chars().all(|c| c.is_ascii_digit()) {
-            return Err(anyhow::anyhow!("Invalid timestamp: {:?}", self.timestamp));
+            return Err(anyhow!("Invalid timestamp: {:?}", self.timestamp));
         }
         Ok(format!(
             "({},{},{property},'{}','{}')",
@@ -87,7 +120,7 @@ impl Change {
 
     pub fn get_label_log(&self, text_id: TextId) -> Result<String> {
         if !self.timestamp.chars().all(|c| c.is_ascii_digit()) {
-            return Err(anyhow::anyhow!("Invalid timestamp: {:?}", self.timestamp));
+            return Err(anyhow!("Invalid timestamp: {:?}", self.timestamp));
         }
         Ok(format!(
             "({},{},'{}','{}','{}',{})",
@@ -119,6 +152,21 @@ mod tests {
         assert_eq!(ChangeType::Changed.as_str(), "changed");
         assert_eq!(ChangeType::Removed.as_str(), "removed");
         assert_eq!(ChangeType::Added.as_str(), "added");
+    }
+
+    #[test]
+    fn test_from_str_round_trips() {
+        for subject in ChangeSubject::ALL {
+            assert_eq!(subject.as_str().parse::<ChangeSubject>().unwrap(), subject);
+        }
+        for change_type in ChangeType::ALL {
+            assert_eq!(
+                change_type.as_str().parse::<ChangeType>().unwrap(),
+                change_type
+            );
+        }
+        assert!("Labels".parse::<ChangeSubject>().is_err());
+        assert!("".parse::<ChangeType>().is_err());
     }
 
     #[test]

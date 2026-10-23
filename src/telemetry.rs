@@ -3,16 +3,29 @@
 
 use std::time::Duration;
 use wikimisc::metrics::{counter, gauge};
-use wikimisc::telemetry::Telemetry;
+use wikimisc::telemetry::{Telemetry, TelemetryBuilder};
 use wikimisc::timestamp::TimeStamp;
 
 /// Starts pushing to the dashboard (token from `$DASHBOARD_TOKEN`). Optional: without a token,
 /// or on any error, the bot just runs without it; the outcome is logged. On SIGTERM it sends a
 /// final push and exits.
-pub fn start() {
-    Telemetry::builder("bot")
-        .version(env!("CARGO_PKG_VERSION"))
-        .install_or_log();
+pub fn start_bot() {
+    builder("bot").install_or_log();
+}
+
+/// Like `start_bot`, for the web service. Signals are left to its graceful shutdown
+/// (`wikimisc::server::serve`), which sends the final push once requests have drained.
+pub fn start_web() {
+    builder("web").handle_signals(false).install_or_log();
+}
+
+fn builder(component: &str) -> TelemetryBuilder {
+    Telemetry::builder(component).version(env!("CARGO_PKG_VERSION"))
+}
+
+/// An API request for `action` (one of a fixed set, see `api::Action::name`).
+pub fn record_api_request(action: &'static str) {
+    counter!("wdrc_api_requests_total", "action" => action).increment(1);
 }
 
 /// How one `run_once` ended: `more_work`, `caught_up` or `error`.
@@ -40,7 +53,7 @@ pub fn set_text_cache_entries(entries: usize) {
 }
 
 /// How far a MediaWiki timestamp (`YYYYMMDDHHMMSS`) lies behind now; `None` if unparseable.
-fn lag(timestamp: &str) -> Option<Duration> {
+pub fn lag(timestamp: &str) -> Option<Duration> {
     let then = TimeStamp::str2utc(timestamp)?;
     let now = TimeStamp::str2utc(&TimeStamp::now())?;
     (now - then).to_std().ok()
@@ -65,5 +78,6 @@ mod tests {
         record_batch(10, 20, "20200101000000");
         record_aux_failure("deletions");
         set_text_cache_entries(5);
+        record_api_request("lag");
     }
 }

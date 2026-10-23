@@ -16,5 +16,6 @@
 	"//bot_sleep_sec": "between passes once caught up (10)",
 	"//db_timeout_sec": "per query (300)",
 	"//run_timeout_sec": "per pass (600)",
-	"//logging": "print per-batch progress (false)"
+	"//logging": "print per-batch progress (false)",
+	"//web_max_connections": "ToolsDB connections of the web service (4)"
 }
