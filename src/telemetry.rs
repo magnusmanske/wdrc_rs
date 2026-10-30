@@ -3,24 +3,20 @@
 
 use std::time::Duration;
 use wikimisc::metrics::{counter, gauge};
-use wikimisc::telemetry::{Telemetry, TelemetryBuilder};
+use wikimisc::telemetry;
 use wikimisc::timestamp::TimeStamp;
 
 /// Starts pushing to the dashboard (token from `$DASHBOARD_TOKEN`). Optional: without a token,
 /// or on any error, the bot just runs without it; the outcome is logged. On SIGTERM it sends a
 /// final push and exits.
 pub fn start_bot() {
-    builder("bot").install_or_log();
+    telemetry::install_bot(env!("CARGO_PKG_VERSION"), None);
 }
 
 /// Like `start_bot`, for the web service. Signals are left to its graceful shutdown
 /// (`wikimisc::server::serve`), which sends the final push once requests have drained.
 pub fn start_web() {
-    builder("web").handle_signals(false).install_or_log();
-}
-
-fn builder(component: &str) -> TelemetryBuilder {
-    Telemetry::builder(component).version(env!("CARGO_PKG_VERSION"))
+    telemetry::install_web(env!("CARGO_PKG_VERSION"), None);
 }
 
 /// An API request for `action` (one of a fixed set, see `api::Action::name`).
