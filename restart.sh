@@ -3,7 +3,7 @@
 # The web service is restarted separately, with webservice.sh.
 toolforge jobs delete rustbot
 rm ~/rustbot.*
-toolforge jobs run --mem 2000Mi --cpu 1 --continuous --mount=all \
+toolforge jobs run --mem 512Mi --continuous --mount=all \
 	--image tool-wdrc/tool-wdrc:latest \
 	--command bot \
 	--filelog -o /data/project/wdrc/rustbot.out -e /data/project/wdrc/rustbot.err \
